@@ -20,7 +20,7 @@ import os
 import sys
 from typing import Iterator
 
-from .audio import encode_wav, resample_linear, turn_to_row
+from .audio import AUDIO_EXT, encode_audio, resample_linear, turn_to_row
 from .schema import EOTRow, TurnConfig
 from .sources import SOURCES
 from .turns import build_turns
@@ -39,6 +39,9 @@ def build_rows(
     malaysian_mode: str = "streaming",
     malaysian_zips: list[str] | None = None,
     malaysian_max_scan: int | None = None,
+    malaysian_backend: str = "download",
+    malaysian_n_zips: int = 4,
+    malaysian_shard: tuple[int, int] | None = None,
     hf_token: str | None = None,
 ) -> Iterator[EOTRow]:
     """Yield finished :class:`EOTRow` objects from a source corpus.
@@ -55,6 +58,10 @@ def build_rows(
         kwargs["zip_names"] = malaysian_zips
         kwargs["max_scan"] = malaysian_max_scan
         kwargs["token"] = hf_token
+        kwargs["backend"] = malaysian_backend
+        kwargs["n_zips"] = malaysian_n_zips
+        if malaysian_shard is not None:
+            kwargs["shard_index"], kwargs["shard_count"] = malaysian_shard
     recordings = SOURCES[source](config, **kwargs)
 
     def with_mode(m: str) -> TurnConfig:
@@ -127,6 +134,7 @@ def write_parquet(
     out_path: str,
     sampling_rate: int = 16000,
     batch_size: int = 256,
+    audio_format: str = "wav",
 ) -> int:
     """Write an eot-bench-compatible parquet directly with pyarrow. Returns row count.
 
@@ -141,6 +149,7 @@ def write_parquet(
     import pyarrow.parquet as pq
 
     schema = _arrow_schema(sampling_rate)
+    ext = AUDIO_EXT.get(audio_format, audio_format)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
     def empty() -> dict[str, list]:
@@ -163,7 +172,8 @@ def write_parquet(
     try:
         for r in rows:
             buf["id"].append(r.id)
-            buf["audio"].append({"bytes": encode_wav(r.audio, r.sampling_rate), "path": None})
+            buf["audio"].append({"bytes": encode_audio(r.audio, r.sampling_rate, audio_format),
+                                 "path": f"{r.id}.{ext}"})
             buf["language"].append(r.language)
             buf["duration"].append(float(round(r.duration, 3)))
             buf["silence_spans"].append(r.silence_spans)
@@ -191,6 +201,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", required=True, help="output .parquet path")
     p.add_argument("--limit", type=int, default=None, help="max source recordings to read")
     p.add_argument("--target-sr", type=int, default=16000)
+    p.add_argument("--audio-format", default="wav", choices=["wav", "flac", "mp3", "ogg"])
     p.add_argument("--no-streaming", action="store_true", help="download the full split first")
     p.add_argument("--malaysian-mode", default="streaming", choices=["streaming", "whole"])
     p.add_argument("--malaysian-zips", default=None,
@@ -238,7 +249,7 @@ def main(argv: list[str] | None = None) -> None:
         malaysian_max_scan=args.malaysian_max_scan,
         hf_token=os.environ.get("HF_TOKEN"),
     )
-    n = write_parquet(rows, args.out, sampling_rate=args.target_sr)
+    n = write_parquet(rows, args.out, sampling_rate=args.target_sr, audio_format=args.audio_format)
     print(f"wrote {n} rows -> {args.out}", flush=True)
     sys.stdout.flush()
     sys.stderr.flush()

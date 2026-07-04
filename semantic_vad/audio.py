@@ -9,18 +9,46 @@ import numpy as np
 from .schema import EOTRow, Turn
 
 
-def encode_wav(array: np.ndarray, sr: int, subtype: str = "PCM_16") -> bytes:
-    """Encode a mono float32 array to WAV bytes.
+#: file extension per stored audio format.
+AUDIO_EXT = {"wav": "wav", "flac": "flac", "mp3": "mp3", "ogg": "ogg"}
 
-    This is how the audio is stored in the parquet (as ``{"bytes", "path"}``), matching
-    `livekit/eot-bench-data`: the harness decodes the bytes with soundfile. Doing the
-    encoding ourselves avoids the torch/torchcodec dependency ``datasets`` otherwise needs
-    to serialize an ``Audio`` array.
-    """
+
+def encode_wav(array: np.ndarray, sr: int, subtype: str = "PCM_16") -> bytes:
+    """Encode a mono float32 array to WAV bytes (kept for the tests / default path)."""
     import soundfile as sf
 
     buf = io.BytesIO()
     sf.write(buf, to_mono_f32(array), int(sr), format="WAV", subtype=subtype)
+    return buf.getvalue()
+
+
+def encode_audio(array: np.ndarray, sr: int, fmt: str = "wav", mp3_bitrate: int = 48) -> bytes:
+    """Encode a mono float32 array to ``fmt`` bytes for storage in the parquet.
+
+    ``wav``/``flac``/``ogg`` go through soundfile; ``mp3`` uses ``lameenc`` (libsndfile can
+    decode mp3 but not encode it). mp3 at ~48 kbps mono is tiny and ample for EOT cues
+    (timing + coarse prosody), and matches the Malaysian source's native format. All formats
+    decode back the eot-bench way: ``soundfile.read(BytesIO(bytes))``.
+    """
+    a = to_mono_f32(array)
+    if fmt == "mp3":
+        import lameenc
+
+        pcm = (np.clip(a, -1.0, 1.0) * 32767.0).astype(np.int16)
+        enc = lameenc.Encoder()
+        enc.set_bit_rate(mp3_bitrate)
+        enc.set_in_sample_rate(int(sr))
+        enc.set_channels(1)
+        enc.set_quality(2)
+        out = enc.encode(pcm.tobytes())
+        out += enc.flush()
+        return bytes(out)
+
+    import soundfile as sf
+
+    buf = io.BytesIO()
+    subtype = {"wav": "PCM_16", "flac": "PCM_16"}.get(fmt)
+    sf.write(buf, a, int(sr), format=fmt.upper(), subtype=subtype)
     return buf.getvalue()
 
 

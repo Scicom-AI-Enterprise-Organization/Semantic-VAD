@@ -21,7 +21,7 @@ export PATH="/root/venv/bin:$PATH"
 
 echo "== install deps (soundfile decodes wav+mp3; no librosa) =="
 uv pip install --python /root/venv/bin/python \
-  datasets pyarrow numpy soundfile huggingface_hub pytest hf_transfer
+  datasets pyarrow numpy soundfile huggingface_hub pytest remotezip lameenc hf_xet
 
 echo "== unit tests (offline) =="
 /root/venv/bin/python -m pytest -q

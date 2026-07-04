@@ -83,3 +83,59 @@ class ZipAudioResolver:
                 z.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+class DownloadZipResolver:
+    """Download whole zip archives (Xet-accelerated) and read members from them locally.
+
+    Local reads (~1 ms) are far cheaper than per-member HTTP range requests (~0.3 s each),
+    so once the archives are resident, throughput is bound by decode/encode, not the network.
+    With ``in_ram=True`` the zip bytes are held in memory (the pod has ~1 TB RAM) and the
+    on-disk copy is deleted, so many archives fit without the 20 GB disk cap biting.
+    """
+
+    def __init__(self, zip_names: list[str], token: str | None = None, in_ram: bool = True,
+                 workdir: str = "/root/data/zdl"):
+        import io
+        import os
+        import zipfile
+
+        from huggingface_hub import hf_hub_download
+
+        os.makedirs(workdir, exist_ok=True)
+        self._zips: dict[str, zipfile.ZipFile] = {}
+        self._index: dict[str, str] = {}
+        for name in zip_names:
+            local = hf_hub_download("malaysia-ai/Malaysian-STT", name, repo_type="dataset",
+                                    token=token, local_dir=workdir)
+            if in_ram:
+                with open(local, "rb") as f:
+                    data = f.read()
+                os.remove(local)
+                zf = zipfile.ZipFile(io.BytesIO(data))
+            else:
+                zf = zipfile.ZipFile(local)
+            self._zips[name] = zf
+            for m in zf.namelist():
+                self._index.setdefault(m, name)
+            print(f"[dl] {name}: {len(zf.namelist())} members "
+                  f"(index now {len(self._index)})", flush=True)
+
+    def available_members(self) -> set[str]:
+        return set(self._index)
+
+    def read_audio(self, member: str) -> tuple[np.ndarray, int]:
+        import soundfile as sf
+
+        if member not in self._index:
+            raise KeyError(member)
+        data = self._zips[self._index[member]].read(member)
+        arr, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+        return np.asarray(arr), int(sr)
+
+    def close(self) -> None:
+        for z in self._zips.values():
+            try:
+                z.close()
+            except Exception:  # noqa: BLE001
+                pass

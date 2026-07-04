@@ -112,6 +112,11 @@ def iter_malaysian(
     zip_names: list[str] | None = None,
     token: str | None = None,
     max_scan: int | None = None,
+    backend: str = "download",
+    n_zips: int = 4,
+    in_ram: bool = True,
+    shard_index: int | None = None,
+    shard_count: int | None = None,
 ) -> Iterator[SourceRecording]:
     """Stream malaysia-ai/Malaysian-STT (whisper-format text; audio inside zip archives).
 
@@ -119,23 +124,27 @@ def iter_malaysian(
     turn -> ``single`` mode). ``source_mode="whole"`` yields the full recording -> ``segment``
     mode (split into pseudo-turns by gap). Only ``level == "word"`` rows are consumed.
 
-    Audio is read from the repo's zip archives via HTTP range requests (see
-    :class:`~semantic_vad.malaysian_audio.ZipAudioResolver`). Pass ``zip_names`` to restrict
-    to specific archives (a small run can index just one); otherwise all matching archives
-    are discovered and indexed. Segments not present in the indexed archives are skipped.
-    ``max_scan`` bounds how many dataset rows to read (so a small run can't scan forever).
+    ``backend="download"`` (default) downloads whole zip archives (Xet-accelerated) and reads
+    members locally -- far faster than the ``"remote"`` per-member HTTP range requests. Only
+    segments present in the resident archives are emitted (the rest are skipped as the stream
+    passes them). ``n_zips`` bounds how many archives to pull; ``shard_index``/``shard_count``
+    partition the row stream across parallel worker processes (worker i takes rows where
+    ``ridx % shard_count == shard_index``). ``max_scan`` caps rows read.
     """
     from datasets import load_dataset
 
-    from .malaysian_audio import ZipAudioResolver, discover_zip_names
+    from .malaysian_audio import DownloadZipResolver, ZipAudioResolver, discover_zip_names
 
     prefix = f"{config}-{'segment' if source_mode == 'streaming' else 'whole'}"
     if zip_names is None:
-        zip_names = discover_zip_names(prefix, token=token)
-    resolver = ZipAudioResolver(zip_names, token=token)
-    for name in zip_names:
-        n = resolver.index_zip(name)
-        print(f"[info] indexed {name}: {n} members", flush=True)
+        zip_names = discover_zip_names(prefix, token=token)[:n_zips]
+
+    if backend == "download":
+        resolver = DownloadZipResolver(zip_names, token=token, in_ram=in_ram)
+    else:
+        resolver = ZipAudioResolver(zip_names, token=token)
+        for name in zip_names:
+            resolver.index_zip(name)
 
     suggested = "single" if source_mode == "streaming" else "segment"
     ds = load_dataset(MALAYSIAN_REPO, config, split=split, streaming=streaming)
@@ -143,6 +152,8 @@ def iter_malaysian(
     for ridx, row in enumerate(ds):
         if max_scan is not None and ridx >= max_scan:
             break
+        if shard_count and (ridx % shard_count) != shard_index:
+            continue
         if row.get("mode") != source_mode or row.get("level") != "word":
             continue
         texts = row.get("texts") or []
