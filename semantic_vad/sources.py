@@ -171,6 +171,13 @@ def iter_malaysian(
             words = parse_whisper_timestamps(text)
             if not words:
                 continue
+            # In streaming mode each segment's mp3 is trimmed to that segment (starts at 0),
+            # but the whisper timestamps are ABSOLUTE in the full recording. Re-zero to the
+            # segment's first word so word times align with the clip.
+            if source_mode == "streaming":
+                off = words[0].start
+                if off:
+                    words = [Word(w.word, w.start - off, w.end - off) for w in words]
             try:
                 array, sr = resolver.read_audio(fname)
             except KeyError:
