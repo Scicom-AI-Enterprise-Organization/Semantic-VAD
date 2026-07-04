@@ -43,6 +43,71 @@ labels:            HOLD                                    HOLD                 
 > turn boundaries are known from who-spoke-when; forced-alignment corpora don't have that,
 > so `single` mode (one utterance = one turn) is the closest honest equivalent.
 
+## The model this dataset feeds (semantic-VAD architecture)
+
+LiveKit's turn detector is a **dual-branch** model — a *semantic* branch (audio → adapter →
+LLM) and an *acoustic* branch (encoder → RNN for prosody), fused into one prediction. **We
+build only the semantic branch.** The acoustic branch is the part that needs the most
+from-scratch pretraining, and the semantic branch alone already answers the core question:
+*does the content sound complete?* Dropping fusion keeps the model small and the training
+cheap; the schema stays branch-agnostic so acoustics can be re-added later with no data
+changes.
+
+### The branch we build
+
+```
+audio (current turn) ─► Whisper encoder ─► adapter ─► Qwen3 ─► EOT head ─► P(end-of-turn)
+```
+
+- **Whisper encoder** — audio → frame embeddings (bidirectional, fixed ≤ 30 s window).
+- **Adapter** — projects those into **Qwen3's** text-embedding space, so the LLM gets the
+  same semantic signal a text model would **without ever producing a transcript**. This is
+  the **Qwen-Audio / SALMONN** recipe, using **Qwen3** in place of Qwen2.
+- **EOT head** — a small `hold`/`eot` classifier on Qwen3's hidden state at the decision point.
+
+> **Not a repurposed STT model.** The adapter is *aligned* into the LLM's embedding space —
+> a transcription-style loss is convenient supervision for that alignment — but STT is
+> scaffolding, not the product: no transcript is emitted at inference.
+
+### Streaming: causality is bounded to one *turn*, not the session
+
+Audio streams continuously (minutes), but the model only ever sees **the current turn's
+buffer**, which the dialogue layer flushes on every detected end-of-turn:
+
+```
+user starts speaking ─► accumulate audio into the turn buffer
+  ├─ mid-turn pause (hold) ─► keep accumulating (do NOT reset — the point of semantic VAD)
+  └─ EOT fires             ─► emit end-of-turn, FLUSH buffer, agent takes over
+next utterance ─► fresh buffer
+```
+
+This keeps the design small:
+
+- **Causality is free where it matters.** Qwen3 is already causal (causal mask + RoPE + KV
+  cache). The only requirement is that a prediction at time *t* uses audio ≤ *t* — a buffer
+  ending at "now" satisfies that even though the Whisper encoder is internally bidirectional.
+  Bidirectional-over-buffered-past ≠ acausal.
+- **No long-context machinery.** The buffer is one turn (`< 30 s`) — exactly what each row in
+  this dataset represents — so Whisper's fixed 30 s / 1500-frame window is a *fit*, not a
+  limit, and matches the training distribution. A per-turn buffer never grows past that, so
+  re-encoding it and re-prefilling Qwen3 stays cheap; **no chunked/causal-encoder finetune is
+  needed** (that only pays off for an unbounded growing window, which we don't have).
+- **VAD-gated.** Only run Qwen3 when a cheap energy/silence VAD flags a pause candidate
+  (silence ≥ `min_silence`); mid-word the answer is trivially "no". These pause candidates are
+  exactly the `silence_spans` this dataset encodes.
+- **Text vs. audio scope.** If you later use dialogue context (`messages`), feed prior turns
+  as a short *text* prefix (session-scoped, cheap); only the *audio* prefix resets per turn.
+
+> ⚠️ LiveKit's blog documents the *architecture* and benchmarks, **not** the training
+> curriculum — branch count, adapter-alignment, fusion, and losses are design choices we're
+> making, not documented facts. We drop the acoustic branch on purpose.
+
+### How this dataset maps to it
+
+`words` (content + order) supervise the semantic branch; `silence_spans` (EOT positionally
+last) define the decision points the VAD gate fires on and the `hold`/`eot` targets. The
+schema stays branch-agnostic, so re-adding an acoustic branch later needs no data changes.
+
 ## Output schema (matches `eot-bench-data`)
 
 | column | type | notes |
@@ -142,21 +207,27 @@ write_parquet(iter(rows), "data/en.parquet")          # eot-bench-compatible par
   mode gives natural per-segment turns, `whole` a long recording. Pass `--malaysian-zips`
   to limit which archives are indexed.
 
-## Running on RunPod + pushing to HF
+## Running on RunPod + pushing to HF (full scale)
 
-Large source corpora → build on a CPU pod, not a laptop. `deploy/` has a stdlib-only
-control plane (see `CLAUDE.md` for the full flow):
+Large source corpora → build on a multi-vCPU CPU pod, not a laptop. `deploy/` has a
+stdlib-only control plane (see `CLAUDE.md` for the full flow):
 
 ```bash
-python3 deploy/runpod_ctl.py create --disk 20   # US CPU pod, SSH via deploy/runpod_key
-python3 deploy/runpod_ctl.py wait                # -> READY <ip> <port>
-# scp code + deploy/pod_setup.sh, run it (uv → py3.12 venv, deps, offline pytest)
-# scp deploy/pod_verify.py + pod_verify.sh, run it (build a few langs + Malaysian, push to HF)
-python3 deploy/runpod_ctl.py terminate           # stop billing when done
+python3 deploy/runpod_ctl.py create --flavor cpu3c --vcpu 8 --disk 60   # US CPU pod
+python3 deploy/runpod_ctl.py wait                                        # -> READY <ip> <port>
+# scp code + deploy/pod_setup.sh, run it (uv → py3.12 venv, deps incl lameenc/remotezip/hf_xet)
+# scp deploy/pod_scale_big.py + pod_finalize.py + pod_launch.sh, then:
+#   ML_LIMIT=500000 MS_LIMIT=500000 CONC=8 nohup bash pod_launch.sh
+python3 deploy/runpod_ctl.py terminate                                   # stop billing when done
 ```
 
-A verification sample built this way (en/es/ja + Malaysian, 280 rows) lives at
-**[huseinzolkepliscicom/semantic-vad-eot](https://huggingface.co/datasets/huseinzolkepliscicom/semantic-vad-eot)**.
+`pod_launch.sh` runs Phase 1 (multilingual, one parallel worker per language) then Phase 2
+(Malaysian, per subset: download a few zips once, then `CONC` sharded workers), uploading mp3
+parquet shards to HF and deleting them locally so the disk never fills. **Xet**
+(`HF_XET_HIGH_PERFORMANCE=1` + `hf_xet`) accelerates HF transfer. Throughput ≈ 70 rows/s/core
+(mp3 @32 kbps), so a full 500k/language + 500k/Malaysian-subset build (~8.4M turns, ~170 GB
+mp3) runs in a few hours on 8 vCPUs. The result:
+**[Scicom-intl/semantic-vad-eot](https://huggingface.co/datasets/Scicom-intl/semantic-vad-eot)**.
 
 ## Layout
 

@@ -20,14 +20,13 @@ Env:
 """
 
 import gc
-import itertools
 import os
 import sys
 import time
 
 sys.path.insert(0, "/root/semantic-vad")
 from semantic_vad.build import build_rows, write_parquet  # noqa: E402
-from semantic_vad.malaysian_audio import discover_zip_names  # noqa: E402
+from semantic_vad.malaysian_audio import discover_zip_names, zip_prefix  # noqa: E402
 from semantic_vad.schema import TurnConfig  # noqa: E402
 
 TOKEN = os.environ["HF_TOKEN"]
@@ -42,15 +41,6 @@ DATA = "/root/data"
 os.makedirs(DATA, exist_ok=True)
 
 
-def chunked(iterable, size):
-    it = iter(iterable)
-    while True:
-        chunk = list(itertools.islice(it, size))
-        if not chunk:
-            return
-        yield chunk
-
-
 def make_rows():
     cfg = TurnConfig(mode="single")
     if KIND == "ml":
@@ -58,7 +48,7 @@ def make_rows():
                           limit=LIMIT, streaming=True, hf_token=TOKEN)
     n_zips = int(os.environ.get("N_ZIPS", "3"))
     workdir = os.environ.get("ZIP_WORKDIR", f"{DATA}/zips-{CONFIG}")
-    zips = discover_zip_names(f"{CONFIG}-segment", token=TOKEN)[:n_zips]
+    zips = discover_zip_names(zip_prefix(CONFIG, "streaming"), token=TOKEN)[:n_zips]
     shard = None
     if os.environ.get("SHARD_CNT"):
         shard = (int(os.environ["SHARD_IDX"]), int(os.environ["SHARD_CNT"]))
@@ -66,6 +56,7 @@ def make_rows():
                       limit=LIMIT, streaming=True, hf_token=TOKEN,
                       malaysian_mode="streaming", malaysian_zips=zips,
                       malaysian_backend="download", malaysian_n_zips=n_zips,
+                      malaysian_workdir=workdir, malaysian_in_ram=False,
                       malaysian_shard=shard, malaysian_max_scan=50_000_000)
 
 
@@ -76,9 +67,15 @@ def main():
     suffix = f"-s{os.environ.get('SHARD_IDX')}" if os.environ.get("SHARD_CNT") else ""
     t0 = time.time()
     total = 0
-    for si, chunk in enumerate(chunked(make_rows(), SHARD_ROWS)):
+    # One persistent generator; write_parquet streams up to SHARD_ROWS per shard (256-row
+    # batches internally), so raw audio arrays are never bulk-buffered -> bounded memory.
+    gen = make_rows()
+    si = 0
+    while True:
         shard_path = f"{DATA}/{KEY}{suffix}-{si:05d}.parquet"
-        n = write_parquet(iter(chunk), shard_path, audio_format=AUDIO_FORMAT)
+        n = write_parquet(gen, shard_path, audio_format=AUDIO_FORMAT, max_rows=SHARD_ROWS)
+        if n == 0:
+            break
         dst = f"data/{KEY}{suffix}-{si:05d}.parquet"
         api.upload_file(path_or_fileobj=shard_path, repo_id=REPO, repo_type="dataset",
                         path_in_repo=dst)
@@ -87,8 +84,10 @@ def main():
         rate = total / max(1e-9, time.time() - t0)
         print(f"[{KEY}{suffix}] shard {si} +{n} -> {dst} | total={total} ({rate:.1f} rows/s)",
               flush=True)
-        del chunk
+        si += 1
         gc.collect()
+        if n < SHARD_ROWS:  # generator exhausted mid-shard
+            break
     print(f"[{KEY}{suffix}] DONE total={total} in {time.time()-t0:.0f}s", flush=True)
 
 

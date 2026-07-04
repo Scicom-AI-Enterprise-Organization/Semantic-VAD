@@ -115,6 +115,7 @@ def iter_malaysian(
     backend: str = "download",
     n_zips: int = 4,
     in_ram: bool = True,
+    workdir: str | None = None,
     shard_index: int | None = None,
     shard_count: int | None = None,
 ) -> Iterator[SourceRecording]:
@@ -133,14 +134,17 @@ def iter_malaysian(
     """
     from datasets import load_dataset
 
-    from .malaysian_audio import DownloadZipResolver, ZipAudioResolver, discover_zip_names
+    from .malaysian_audio import (DownloadZipResolver, ZipAudioResolver,
+                                  discover_zip_names, zip_prefix)
 
-    prefix = f"{config}-{'segment' if source_mode == 'streaming' else 'whole'}"
     if zip_names is None:
-        zip_names = discover_zip_names(prefix, token=token)[:n_zips]
+        zip_names = discover_zip_names(zip_prefix(config, source_mode), token=token)[:n_zips]
 
     if backend == "download":
-        resolver = DownloadZipResolver(zip_names, token=token, in_ram=in_ram)
+        kw = {"in_ram": in_ram}
+        if workdir:
+            kw["workdir"] = workdir
+        resolver = DownloadZipResolver(zip_names, token=token, **kw)
     else:
         resolver = ZipAudioResolver(zip_names, token=token)
         for name in zip_names:
@@ -148,12 +152,14 @@ def iter_malaysian(
 
     suggested = "single" if source_mode == "streaming" else "segment"
     ds = load_dataset(MALAYSIAN_REPO, config, split=split, streaming=streaming)
+    # Shard at the file level (NOT by row index): the dataset cycles 4 row-types per
+    # recording, so a row-index modulo would send every word-level row to one shard.
+    if shard_count:
+        ds = ds.shard(num_shards=shard_count, index=shard_index)
     emitted = 0
     for ridx, row in enumerate(ds):
         if max_scan is not None and ridx >= max_scan:
             break
-        if shard_count and (ridx % shard_count) != shard_index:
-            continue
         if row.get("mode") != source_mode or row.get("level") != "word":
             continue
         texts = row.get("texts") or []

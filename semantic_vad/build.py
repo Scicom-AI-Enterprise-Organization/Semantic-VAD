@@ -41,6 +41,8 @@ def build_rows(
     malaysian_max_scan: int | None = None,
     malaysian_backend: str = "download",
     malaysian_n_zips: int = 4,
+    malaysian_workdir: str | None = None,
+    malaysian_in_ram: bool = True,
     malaysian_shard: tuple[int, int] | None = None,
     hf_token: str | None = None,
 ) -> Iterator[EOTRow]:
@@ -60,6 +62,9 @@ def build_rows(
         kwargs["token"] = hf_token
         kwargs["backend"] = malaysian_backend
         kwargs["n_zips"] = malaysian_n_zips
+        kwargs["in_ram"] = malaysian_in_ram
+        if malaysian_workdir:
+            kwargs["workdir"] = malaysian_workdir
         if malaysian_shard is not None:
             kwargs["shard_index"], kwargs["shard_count"] = malaysian_shard
     recordings = SOURCES[source](config, **kwargs)
@@ -135,6 +140,7 @@ def write_parquet(
     sampling_rate: int = 16000,
     batch_size: int = 256,
     audio_format: str = "wav",
+    max_rows: int | None = None,
 ) -> int:
     """Write an eot-bench-compatible parquet directly with pyarrow. Returns row count.
 
@@ -183,12 +189,14 @@ def write_parquet(
             if len(buf["id"]) >= batch_size:
                 flush()
                 buf = empty()
+            if max_rows is not None and n >= max_rows:
+                break
         flush()
     finally:
         if writer is not None:
             writer.close()
 
-    if n == 0:
+    if n == 0 and max_rows is None:
         raise SystemExit("no rows produced -- check the source/config/filters")
     return n
 

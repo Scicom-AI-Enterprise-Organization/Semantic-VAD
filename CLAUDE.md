@@ -71,10 +71,21 @@ python3 deploy/runpod_ctl.py terminate           # tear down when done (stops bi
   via the pod's `PUBLIC_KEY` env for SSH. CPU container disk is capped at 20 GB.
 - **HF token on the pod**: RunPod env vars are NOT visible in SSH sessions, so scp the
   `HF_TOKEN=` line from `.env` to `/root/.hf_env` (chmod 600) and `source` it in pod scripts.
-- `deploy/pod_verify.py` — build + concat + push. Produced
-  `huseinzolkepliscicom/semantic-vad-eot` (280-row en/es/ja/ms sample, PUBLIC by default).
-  Tar the repo for transfer with `COPYFILE_DISABLE=1 tar ... --exclude='._*'` and extract
-  with `--no-same-owner` (macOS xattrs otherwise make GNU tar exit non-zero under `set -e`).
+- `deploy/pod_verify.py` — small build + concat + push (verification sample).
+- **Full-scale run** (`deploy/pod_launch.sh`): Phase 1 multilingual (one parallel worker per
+  language via `pod_scale_big.py`), Phase 2 Malaysian (per subset: predownload a few zips to a
+  shared dir, then `CONC` sharded workers). Uploads mp3 shards to `Scicom-intl/semantic-vad-eot`
+  and deletes locally. `ML_LIMIT`/`MS_LIMIT`/`CONC`/`N_ZIPS`/`SHARD_ROWS` env-tunable;
+  `pod_finalize.py` writes the card. For >20 GB disk use `--flavor cpu3c` (allows 60 GB) — cpu3g
+  caps at 20; cpu5c was often unavailable.
+- **Audio = mp3** (`lameenc`, 32 kbps, quality 7 ≈ 70 rows/s/core; quality 2 was ~40). Format via
+  `write_parquet(audio_format=...)` / `--audio-format`; WAV/FLAC go through soundfile.
+- **Malaysian audio** = whole zips downloaded (Xet) via `DownloadZipResolver`, read locally
+  (≫ per-mp3 range request). Zips shared across shard workers (reused if already on disk).
+  Bump `N_ZIPS` for big subsets (imda/dialects) if they're streaming-bound (low member hit-rate).
+- **Xet**: `pip install hf_xet` + `HF_XET_HIGH_PERFORMANCE=1` for fast HF transfer.
+- Tar the repo with `COPYFILE_DISABLE=1 tar ... --exclude='._*'`; extract with `--no-same-owner`
+  (macOS xattrs otherwise make GNU tar exit non-zero under `set -e`).
 - SSH pattern (laptop → pod, tiny control traffic only):
   `ssh -i deploy/runpod_key -p <port> -o StrictHostKeyChecking=no root@<ip>`
 - Run long jobs on the pod with `nohup ... > log 2>&1 &` and poll the log over SSH so a

@@ -22,7 +22,8 @@ def encode_wav(array: np.ndarray, sr: int, subtype: str = "PCM_16") -> bytes:
     return buf.getvalue()
 
 
-def encode_audio(array: np.ndarray, sr: int, fmt: str = "wav", mp3_bitrate: int = 48) -> bytes:
+def encode_audio(array: np.ndarray, sr: int, fmt: str = "wav", mp3_bitrate: int = 32,
+                 mp3_quality: int = 7) -> bytes:
     """Encode a mono float32 array to ``fmt`` bytes for storage in the parquet.
 
     ``wav``/``flac``/``ogg`` go through soundfile; ``mp3`` uses ``lameenc`` (libsndfile can
@@ -39,7 +40,7 @@ def encode_audio(array: np.ndarray, sr: int, fmt: str = "wav", mp3_bitrate: int 
         enc.set_bit_rate(mp3_bitrate)
         enc.set_in_sample_rate(int(sr))
         enc.set_channels(1)
-        enc.set_quality(2)
+        enc.set_quality(mp3_quality)  # 0=best/slowest .. 9=fastest; 7 is fast + fine for speech
         out = enc.encode(pcm.tobytes())
         out += enc.flush()
         return bytes(out)

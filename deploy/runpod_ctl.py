@@ -92,12 +92,17 @@ def cmd_create(args, env, key):
         "cloudType": "SECURE",
         "imageName": args.image,
         "containerDiskInGb": args.disk,
-        "volumeInGb": 0,  # no /workspace network volume -- work under / (container disk)
+        "volumeInGb": args.volume,
         "ports": ["22/tcp"],
         "cpuFlavorIds": [args.flavor],
+        "cpuFlavorPriority": "availability",
         "dataCenterIds": US_DCS,
         "env": penv,
     }
+    if args.vcpu:
+        body["vcpuCount"] = args.vcpu
+    if args.volume:
+        body["volumeMountPath"] = "/data"  # keep data off /workspace
     pod = api("POST", "/pods", key, body)
     save_pod(pod)
     print(f"created pod id={pod.get('id')} status={pod.get('desiredStatus')}")
@@ -148,6 +153,8 @@ def main():
     c.add_argument("--image", default="runpod/base:0.5.1-cpu")
     c.add_argument("--flavor", default="cpu3g")
     c.add_argument("--disk", type=int, default=60)
+    c.add_argument("--vcpu", type=int, default=0, help="vCPU count (0 = flavor default)")
+    c.add_argument("--volume", type=int, default=0, help="network volume GB at /data (0 = none)")
     c.set_defaults(func=cmd_create)
 
     for name, fn in [("status", cmd_status), ("ssh-info", cmd_ssh_info),

@@ -14,6 +14,18 @@ import numpy as np
 
 REPO_BASE = "https://huggingface.co/datasets/malaysia-ai/Malaysian-STT/resolve/main/"
 
+# Subset config name -> archive filename prefix (they differ for some subsets).
+ZIP_PREFIX = {"parliament": "parlimen", "science_english": "science"}
+
+
+def zip_prefix(config: str, source_mode: str = "streaming") -> str:
+    """Archive-name prefix for a subset, e.g. parliament -> 'parlimen-segment'.
+
+    The dataset's ``audio_filenames`` use this same prefix, so zip members match.
+    """
+    base = ZIP_PREFIX.get(config, config)
+    return f"{base}-{'segment' if source_mode == 'streaming' else 'whole'}"
+
 
 def discover_zip_names(prefix: str, token: str | None = None) -> list[str]:
     """List archive names in the repo that start with ``prefix`` (e.g. ``malaysian-segment``)."""
@@ -106,8 +118,14 @@ class DownloadZipResolver:
         self._zips: dict[str, zipfile.ZipFile] = {}
         self._index: dict[str, str] = {}
         for name in zip_names:
-            local = hf_hub_download("malaysia-ai/Malaysian-STT", name, repo_type="dataset",
-                                    token=token, local_dir=workdir)
+            # Reuse a pre-downloaded copy if present (shared across parallel shard workers),
+            # else download it (Xet-accelerated). Avoids N workers re-fetching the same zip.
+            existing = os.path.join(workdir, name)
+            if os.path.exists(existing) and os.path.getsize(existing) > 0:
+                local = existing
+            else:
+                local = hf_hub_download("malaysia-ai/Malaysian-STT", name, repo_type="dataset",
+                                        token=token, local_dir=workdir)
             if in_ram:
                 with open(local, "rb") as f:
                     data = f.read()
