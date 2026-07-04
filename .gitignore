@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+*.parquet
+deploy/runpod_key
+deploy/runpod_key.pub
+deploy/pod.json

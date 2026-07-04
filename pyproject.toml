@@ -1,0 +1,32 @@
+[project]
+name = "semantic-vad"
+version = "0.1.0"
+description = "Build eot-bench-compatible end-of-turn (semantic VAD) datasets from forced alignments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "datasets>=2.19",
+    "pyarrow",
+    "numpy",
+    "soundfile",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+malaysian = ["remotezip"]   # read Malaysian-STT audio from remote zip archives
+
+[project.scripts]
+svad-build = "semantic_vad.build:main"
+svad-analyze = "semantic_vad.analyze:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["semantic_vad"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
