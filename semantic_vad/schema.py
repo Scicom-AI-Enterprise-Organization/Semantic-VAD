@@ -116,10 +116,13 @@ class TurnConfig:
     mode:
         ``"single"`` treats the whole input utterance as one turn (best when each source
         row is already one complete utterance). ``"segment"`` splits a long recording into
-        pseudo-turns at gaps >= ``turn_gap`` (the "sweet spot").
+        pseudo-turns at gaps >= ``turn_gap``. ``"sentence"`` splits at sentence-final
+        punctuation (``. ? !``, with an abbreviation guard) and also at gaps >= ``turn_gap``
+        -- best for punctuated transcripts (e.g. Malaysian-STT), since continuous speech has
+        no clean gap threshold.
     turn_gap:
-        In ``"segment"`` mode, a gap this long or longer ends a turn (an ``eot``). Find a
-        good value with ``semantic_vad.analyze`` on your corpus.
+        In ``"segment"`` mode a gap this long ends a turn; in ``"sentence"`` mode it is the
+        fallback boundary for un-punctuated stretches.
     eot_trailing:
         Trailing silence (seconds) to include after the last word as the EOT span. If the
         source audio has less trailing silence than this, the clip is zero-padded.
@@ -127,6 +130,11 @@ class TurnConfig:
         Cap on trailing silence included in the EOT span, so long dead air is trimmed.
     lead_in:
         Audio context (seconds) kept before the first word of a turn window.
+    eot_guard:
+        Safety margin (seconds) kept away from a neighboring word when a turn borders other
+        speech in a continuous recording (``segment``/``sentence`` mode). Trailing/lead-in are
+        capped at the real silence gap minus this guard, so a clip never captures the next or
+        previous word's onset (avoids "partial word" sounds).
     min_words:
         Drop turns with fewer words than this.
     min_hold_spans:
@@ -140,13 +148,14 @@ class TurnConfig:
     eot_trailing: float = 0.5
     max_trailing: float = 1.0
     lead_in: float = 0.3
+    eot_guard: float = 0.05
     min_words: int = 1
     min_hold_spans: int = 0
 
     def __post_init__(self) -> None:
-        if self.mode not in ("single", "segment"):
-            raise ValueError(f"mode must be 'single' or 'segment', got {self.mode!r}")
+        if self.mode not in ("single", "segment", "sentence"):
+            raise ValueError(f"mode must be 'single', 'segment' or 'sentence', got {self.mode!r}")
         if self.eot_trailing > self.max_trailing:
             raise ValueError("eot_trailing must be <= max_trailing")
-        if self.mode == "segment" and self.turn_gap <= self.min_silence:
-            raise ValueError("turn_gap must be > min_silence in segment mode")
+        if self.mode in ("segment", "sentence") and self.turn_gap <= self.min_silence:
+            raise ValueError("turn_gap must be > min_silence")

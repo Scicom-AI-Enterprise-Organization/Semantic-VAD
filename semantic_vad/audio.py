@@ -98,6 +98,33 @@ def slice_window(array: np.ndarray, sr: int, start: float, end: float) -> np.nda
     return chunk
 
 
+def speech_end_index(clip: np.ndarray, sr: int, thresh_rel: float = 0.1,
+                     frame_ms: int = 20, hop_ms: int = 10) -> int:
+    """Sample index where speech energy ends (simple energy VAD).
+
+    Returns the end of the last frame whose RMS exceeds ``thresh_rel`` * the clip's loud
+    level. Used to end a turn's clip in the trailing *non-activity* period so it never ends
+    on a (partial) word -- a proper end-of-turn clip should decay to near-silence.
+    """
+    n = len(clip)
+    if n == 0:
+        return 0
+    frame = max(1, int(sr * frame_ms / 1000))
+    hop = max(1, int(sr * hop_ms / 1000))
+    rms, ends = [], []
+    j = 0
+    while j + frame <= n:
+        rms.append(float(np.sqrt(np.mean(clip[j:j + frame] ** 2))))
+        ends.append(j + frame)
+        j += hop
+    if not rms:
+        return n
+    rms = np.asarray(rms)
+    thresh = max(1e-3, thresh_rel * float(np.percentile(rms, 95)))
+    active = np.nonzero(rms > thresh)[0]
+    return int(ends[active[-1]]) if len(active) else 0
+
+
 def turn_to_row(
     turn: Turn,
     array: np.ndarray,
@@ -106,20 +133,54 @@ def turn_to_row(
     row_id: str,
     language: str,
     messages: list[dict[str, str]] | None = None,
-) -> EOTRow:
-    """Slice the turn's audio window and re-zero all times to the clip start."""
+    trim_trailing: bool = True,
+    trailing_pad: float = 0.15,
+    max_tail_ratio: float = 0.4,
+) -> EOTRow | None:
+    """Slice the turn's audio window, VAD-trim the tail to silence, re-zero times to the clip.
+
+    ``trim_trailing`` uses an energy VAD to find the true end of speech and keeps only
+    ``trailing_pad`` seconds of the following silence, so the clip never ends on a partial
+    word. A real end-of-turn must decay to silence, so if the tail (last 50 ms) is still loud
+    relative to the clip (> ``max_tail_ratio`` * clip RMS) -- e.g. music, or the speaker
+    continued with no pause -- the turn is **dropped** (returns ``None``). Set
+    ``max_tail_ratio`` high (e.g. 1.0) to disable the filter.
+    """
     clip = slice_window(array, sr, turn.window_start, turn.window_end)
     offset = turn.window_start
+
+    if trim_trailing and len(clip):
+        se = speech_end_index(clip, sr)
+        end = min(len(clip), se + int(round(trailing_pad * sr)))
+        last_word_idx = int(round((turn.words[-1].end - offset) * sr))
+        end = max(end, min(len(clip), last_word_idx))  # never cut into the last word
+        clip = clip[:end]
     duration = len(clip) / sr
+
+    # Quality gate: a proper EOT clip ends in silence. Drop clips whose tail is still loud
+    # (no real trailing silence exists -- music or an immediate continuation).
+    clip_rms = float(np.sqrt(np.mean(clip ** 2))) if len(clip) else 0.0
+    tail = clip[-int(round(0.05 * sr)):] if len(clip) else clip
+    tail_rms = float(np.sqrt(np.mean(tail ** 2))) if len(tail) else 0.0
+    if clip_rms > 1e-3 and tail_rms > max(0.04, max_tail_ratio * clip_rms):
+        return None
 
     words = [
         {"word": w.word, "start": round(w.start - offset, 3), "end": round(w.end - offset, 3)}
         for w in turn.words
     ]
-    spans = [
-        {"start": round(s.start - offset, 3), "end": round(s.end - offset, 3)}
-        for s in turn.silence_spans
-    ]
+    spans = []
+    for s in turn.silence_spans:
+        st = round(s.start - offset, 3)
+        en = round(min(s.end - offset, duration), 3)
+        if en > st:
+            spans.append({"start": st, "end": en})
+    if spans:  # the eot silence runs to the (trimmed) clip end
+        spans[-1]["end"] = round(duration, 3)
+    # A valid row must end with a real EOT silence span; drop degenerate ones (the clip
+    # trimmed flush to the last word, so there's no trailing pause to label `eot`).
+    if not spans or (spans[-1]["end"] - spans[-1]["start"]) < 0.08:
+        return None
     return EOTRow(
         id=row_id,
         audio=clip,

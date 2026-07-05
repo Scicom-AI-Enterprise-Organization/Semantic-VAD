@@ -85,7 +85,9 @@ def build_rows(
         turns = build_turns(rec.words, duration, run_cfg)
         for ti, turn in enumerate(turns):
             row_id = f"{rec.language}__{rec.source_id}__turn_{ti:03d}"
-            yield turn_to_row(turn, array, sr, row_id=row_id, language=rec.language)
+            row = turn_to_row(turn, array, sr, row_id=row_id, language=rec.language)
+            if row is not None:  # dropped turns (loud tail = no real EOT silence) return None
+                yield row
 
 
 _VAL_STR = {"dtype": "string", "_type": "Value"}

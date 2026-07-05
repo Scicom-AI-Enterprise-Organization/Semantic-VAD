@@ -20,6 +20,7 @@ Env:
 """
 
 import gc
+import itertools
 import os
 import sys
 import time
@@ -42,19 +43,26 @@ os.makedirs(DATA, exist_ok=True)
 
 
 def make_rows():
-    cfg = TurnConfig(mode="single")
     if KIND == "ml":
-        return build_rows("multilingual", CONFIG, cfg, mode="auto",
+        return build_rows("multilingual", CONFIG, TurnConfig(mode="single"), mode="auto",
                           limit=LIMIT, streaming=True, hf_token=TOKEN)
-    n_zips = int(os.environ.get("N_ZIPS", "3"))
+    # Malaysian: whole-recording audio + word timeline, split into turns at sentence-final
+    # punctuation (with a >= turn_gap silence fallback). Segments-as-turns cut mid-sentence.
+    ms_mode = os.environ.get("MS_MODE", "whole")            # whole recording audio
+    turn_mode = os.environ.get("MS_TURN_MODE", "sentence")   # punctuation + gap fallback
+    turn_gap = float(os.environ.get("TURN_GAP", "1.5"))
+    n_zips = int(os.environ.get("N_ZIPS", "4"))
     workdir = os.environ.get("ZIP_WORKDIR", f"{DATA}/zips-{CONFIG}")
-    zips = discover_zip_names(zip_prefix(CONFIG, "streaming"), token=TOKEN)[:n_zips]
+    zips = discover_zip_names(zip_prefix(CONFIG, ms_mode), token=TOKEN)[:n_zips]
     shard = None
     if os.environ.get("SHARD_CNT"):
         shard = (int(os.environ["SHARD_IDX"]), int(os.environ["SHARD_CNT"]))
-    return build_rows("malaysian", CONFIG, cfg, mode="auto",
-                      limit=LIMIT, streaming=True, hf_token=TOKEN,
-                      malaysian_mode="streaming", malaysian_zips=zips,
+    cfg = TurnConfig(mode=turn_mode, turn_gap=turn_gap, min_silence=0.1)
+    # limit=None here: one whole recording yields many turns (and some are dropped by the
+    # loud-tail filter), so we cap emitted TURNS in main() via islice instead of recordings.
+    return build_rows("malaysian", CONFIG, cfg, mode=turn_mode,
+                      limit=None, streaming=True, hf_token=TOKEN,
+                      malaysian_mode=ms_mode, malaysian_zips=zips,
                       malaysian_backend="download", malaysian_n_zips=n_zips,
                       malaysian_workdir=workdir, malaysian_in_ram=False,
                       malaysian_shard=shard, malaysian_max_scan=50_000_000)
@@ -69,7 +77,8 @@ def main():
     total = 0
     # One persistent generator; write_parquet streams up to SHARD_ROWS per shard (256-row
     # batches internally), so raw audio arrays are never bulk-buffered -> bounded memory.
-    gen = make_rows()
+    # islice caps this worker at LIMIT *turns* (post-drop), so subset totals land near target.
+    gen = itertools.islice(make_rows(), LIMIT)
     si = 0
     while True:
         shard_path = f"{DATA}/{KEY}{suffix}-{si:05d}.parquet"
