@@ -1,5 +1,5 @@
-torch>=2.3
-transformers>=4.56
+torch>=2.12
+transformers==5.12.0
 peft>=0.13
 accelerate>=0.34
 datasets>=2.20
@@ -9,3 +9,6 @@ numpy
 matplotlib
 gradio>=4.44
 huggingface_hub
+kernels==1.14.0 # For FA2 and FA3 using kernels-community
+torchcodec
+torchaudio

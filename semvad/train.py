@@ -52,8 +52,16 @@ class ModelArguments:
     lora_r: int = dataclasses.field(default=16)
     lora_alpha: int = dataclasses.field(default=32)
     lora_dropout: float = dataclasses.field(default=0.05)
+    lora_target_modules: str = dataclasses.field(
+        default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        metadata={"help": "comma-separated module names to attach LoRA adapters to"},
+    )
     resume_adapter: Optional[str] = dataclasses.field(
         default=None, metadata={"help": "dir written by a previous save_adapter() call to continue training from"}
+    )
+    attn_implementation: str = dataclasses.field(
+        default="sdpa",
+        metadata={"help": "attention backend passed to from_pretrained, e.g. sdpa/eager/flash_attention_2"},
     )
 
 
@@ -152,9 +160,15 @@ def main():
         dtype=dtype,
         freeze_audio_tower=model_args.freeze_audio_tower,
         head_config=EoTHeadConfig(head_hidden_size=model_args.head_hidden_size, dropout=model_args.head_dropout),
+        attn_implementation=model_args.attn_implementation,
     )
     if model_args.use_lora:
-        model.apply_lora(r=model_args.lora_r, lora_alpha=model_args.lora_alpha, lora_dropout=model_args.lora_dropout)
+        model.apply_lora(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            target_modules=[m.strip() for m in model_args.lora_target_modules.split(",") if m.strip()],
+        )
     if model_args.resume_adapter:
         model.load_adapter(model_args.resume_adapter)
 

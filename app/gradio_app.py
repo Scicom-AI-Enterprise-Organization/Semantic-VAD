@@ -228,12 +228,13 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--window-seconds", type=float, default=MAX_WINDOW_SECONDS)
     parser.add_argument("--server-port", type=int, default=7860)
+    parser.add_argument("--server-name", default="0.0.0.0")
     parser.add_argument("--share", action="store_true", help="expose a public Gradio link (off by default)")
     args = parser.parse_args()
 
     predictor = MockPredictor() if args.mock else RealPredictor(args.model_name, args.checkpoint, args.device)
     demo = build_demo(predictor, window_seconds=args.window_seconds)
-    demo.queue().launch(server_port=args.server_port, share=args.share)
+    demo.queue().launch(server_name=args.server_name, server_port=args.server_port, share=args.share)
 
 
 if __name__ == "__main__":
