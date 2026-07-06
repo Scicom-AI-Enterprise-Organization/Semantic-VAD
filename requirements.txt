@@ -1,0 +1,11 @@
+torch>=2.3
+transformers>=4.56
+peft>=0.13
+accelerate>=0.34
+datasets>=2.20
+soundfile
+librosa
+numpy
+matplotlib
+gradio>=4.44
+huggingface_hub
