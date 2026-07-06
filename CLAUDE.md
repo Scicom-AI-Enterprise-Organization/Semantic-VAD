@@ -34,6 +34,39 @@ where the **last** span is the true end-of-turn (`eot`) and earlier spans are mi
 
 Data flow: `source row → normalize/parse → build_turns → turn_to_row → EOTRow → parquet`.
 
+## Training (`semantic_vad/training/`)
+
+Fine-tunes the model this dataset feeds: **Whisper encoder → linear adapter → Qwen3**,
+end-of-turn read from a `<|eot|>`/`<|hold|>` marker-token logprob (README's "the branch we
+build"; serving contract in `INTEGRATION.md`). Recipe cribbed from malaysia-ai/malaya
+`session/audiollm` (audio-token injection) but with three deliberate differences the user
+asked for: **no LoRA** (full fine-tune), **flash-attention varlen** packing (`cu_seq_lens_q/k`
++ `max_length_q/k`, à la Multilingual-TTS `qwen3_adamw.py`) — **not** the SDPA
+`block_diagonal_concat_inverted` 4D mask — and an **optional** frozen Whisper encoder.
+
+- `prompt.py` / `packing.py` — **pure Python, torch-free** (so `import semantic_vad` stays
+  offline). `build_example` lays out the chat: system + user(`<|audio_bos|>`+`<|AUDIO|>`*N+
+  `<|audio_eos|>`) + assistant(**marker first**, then transcript). Only the assistant span is
+  supervised; marker-first = single-probe serving read. `num_audio_tokens((mel−1)//2+1)` must
+  equal the encoder's per-clip valid-frame count. `build_cu_seqlens` = varlen boundaries.
+- `modeling.py` — `WhisperQwen3(Qwen3ForCausalLM)` + `self.encoder` (HF `WhisperEncoder`) +
+  `self.projection`. `forward` scatters projected audio frames into `inputs_embeds` at
+  `<|AUDIO|>` positions, runs Qwen3 with `attention_mask=None` and the varlen kwargs passed
+  through `**kwargs`, and takes a fused-linear-CE (Liger) loss normalized by
+  `num_items_in_batch`. Global shift is safe across packed boundaries (examples start on
+  masked prompt tokens). `freeze_encoder()` optional.
+- `data.py` — `SemanticVADDataset` reads the eot parquet (`Audio(decode=False)` + soundfile,
+  **no torchcodec**), expands each turn into one `<|eot|>` example (full clip) **plus one
+  `<|hold|>` per internal hold span** (audio truncated at the pause, words up to it), mel-
+  featurizes + tokenizes on the fly. `collate_packed` multipacks a micro-batch into one
+  `[1, total]` varlen sequence. `per_device_train_batch_size` = examples packed per sequence.
+- `train.py` — `python -m semantic_vad.training.train` (also `svad-train`). HF `Trainer`,
+  AdamW, loads Qwen3 + injects pretrained Whisper encoder, adds special tokens, resizes
+  embeddings. Runs on a **GPU pod** — deps in the `[train]` extra (torch, transformers>=4.51,
+  accelerate, liger-kernel) + `flash-attn` installed separately (`--no-build-isolation`,
+  needs nvcc). Launch: `deploy/train_qwen3.sh` (`torchrun`, env-tunable QWEN3_NAME/
+  WHISPER_NAME/TRAIN_FILES/FREEZE_ENCODER). Never on the laptop.
+
 ## Sources
 
 - **AAdonis/multilingual_audio_alignments** — 13 langs, embedded 16 kHz audio, clean
@@ -95,8 +128,10 @@ python3 deploy/runpod_ctl.py terminate           # tear down when done (stops bi
 
 ## Testing
 
-`.venv/bin/python -m pytest -q` (13 tests, offline, use real captured fixtures in
-`tests/fixtures.py`). Keep them network-free.
+`.venv/bin/python -m pytest -q` (25 tests, offline, use real captured fixtures in
+`tests/fixtures.py`; `test_training.py` covers the torch-free prompt/packing helpers). Keep
+them network-free — the heavy training code (modeling/data/train) needs the `[train]` extra
++ a GPU and is exercised on the pod, not in `pytest`.
 
 ## Conventions
 

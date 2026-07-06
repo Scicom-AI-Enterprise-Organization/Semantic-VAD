@@ -229,6 +229,44 @@ parquet shards to HF and deleting them locally so the disk never fills. **Xet**
 mp3) runs in a few hours on 8 vCPUs. The result:
 **[Scicom-intl/semantic-vad-eot](https://huggingface.co/datasets/Scicom-intl/semantic-vad-eot)**.
 
+## Training the model
+
+`semantic_vad/training/` fine-tunes the architecture above — **Whisper encoder → linear
+adapter → Qwen3**, end-of-turn read from a `<|eot|>`/`<|hold|>` marker-token logprob. It
+follows the Qwen-Audio / [malaya `audiollm`](https://github.com/malaysia-ai/malaya/tree/master/session/audiollm)
+recipe for injecting audio into the LLM (project Whisper frames into Qwen3's embedding space
+and scatter them onto `<|AUDIO|>` placeholder tokens), with three choices:
+
+- **Full fine-tune, no LoRA.** Projection + Qwen3 always train; the Whisper encoder trains
+  too unless you pass `--freeze_encoder`.
+- **Flash-attention *varlen* packing.** Examples are packed into one sequence and attention
+  is confined per-example by cumulative sequence lengths (`cu_seq_lens_q/k`, `max_length_q/k`,
+  as in [`qwen3_adamw.py`](https://github.com/Scicom-AI-Enterprise-Organization/Multilingual-TTS/blob/main/qwen3_adamw.py))
+  — **not** an SDPA block-diagonal 4D mask, so no O(L²) mask is built.
+- **Marker-first target.** The assistant emits `<|eot|>`/`<|hold|>` as its *first* token
+  (single-probe serving read, per `INTEGRATION.md`), then the transcript as adapter-alignment
+  supervision. Each turn row yields one `<|eot|>` example (full clip) plus one `<|hold|>`
+  example per mid-turn pause (audio truncated at that pause).
+
+Install the extra + a flash-attention build (**GPU pod, not the laptop**):
+
+```bash
+uv pip install -e ".[train]"                    # torch, transformers>=4.51, accelerate, liger-kernel
+uv pip install flash-attn --no-build-isolation  # needs CUDA + nvcc matched to torch
+```
+
+Launch (small backbone keeps the <1 s serving budget; see `deploy/train_qwen3.sh` for the
+`torchrun` wrapper):
+
+```bash
+python -m semantic_vad.training.train \
+    --qwen3_name Qwen/Qwen3-0.6B --whisper_name openai/whisper-base \
+    --train_files "data/*.parquet" --output_dir out/eot-qwen3 \
+    --bf16 True --attn_implementation flash_attention_2 \
+    --per_device_train_batch_size 8 --gradient_accumulation_steps 4 \
+    --learning_rate 1e-5 --num_train_epochs 1 --gradient_checkpointing True
+```
+
 ## Layout
 
 ```
@@ -241,8 +279,14 @@ semantic_vad/
   sources.py    iter_multilingual / iter_malaysian streaming adapters
   malaysian_audio.py  ZipAudioResolver — read mp3s from remote zips via range requests
   build.py      build_rows + `-m semantic_vad.build` CLI (writes parquet with pyarrow)
-tests/          parser/turn/analyze/build unit tests on real captured fixtures (offline)
-deploy/         RunPod control plane + pod setup/build/verify scripts
+  training/     Whisper→adapter→Qwen3 EOT trainer (GPU, `[train]` extra):
+    prompt.py     build_example (marker-first chat), num_audio_tokens  ← torch-free
+    packing.py    build_cu_seqlens (flash-attn varlen boundaries)      ← torch-free
+    modeling.py   WhisperQwen3 (audio-token injection + varlen + fused-linear CE)
+    data.py       SemanticVADDataset (turn→eot+hold examples) + collate_packed
+    train.py      HF Trainer entrypoint (`-m semantic_vad.training.train` / svad-train)
+tests/          parser/turn/analyze/build/training unit tests on real fixtures (offline)
+deploy/         RunPod control plane + pod setup/build/verify + train_qwen3.sh
 ```
 
 ## Limitations & honest notes
