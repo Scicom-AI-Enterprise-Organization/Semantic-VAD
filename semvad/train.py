@@ -71,6 +71,13 @@ class DataArguments:
     dataset_name: Optional[str] = dataclasses.field(
         default="en", metadata={"help": "HF dataset config, e.g. en/de/es/... or 'all'"}
     )
+    eval_dataset_path: Optional[str] = dataclasses.field(
+        default=None,
+        metadata={"help": "defaults to --dataset_path; set to evaluate against a different dataset"},
+    )
+    eval_dataset_name: Optional[str] = dataclasses.field(
+        default=None, metadata={"help": "defaults to --dataset_name; config for --eval_dataset_path"}
+    )
     train_split: str = dataclasses.field(default="train")
     eval_split: Optional[str] = dataclasses.field(default="validation")
     streaming: bool = dataclasses.field(
@@ -187,8 +194,8 @@ def main():
     eval_dataset = None
     if data_args.eval_split:
         eval_dataset = load_causal_dataset(
-            data_args.dataset_path,
-            data_args.dataset_name,
+            data_args.eval_dataset_path or data_args.dataset_path,
+            data_args.eval_dataset_name or data_args.dataset_name,
             data_args.eval_split,
             streaming=data_args.streaming,
             num_proc=data_args.dataloader_num_workers_data or None,

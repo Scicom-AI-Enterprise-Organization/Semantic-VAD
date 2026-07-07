@@ -50,17 +50,26 @@ def iter_causal_examples(
     for idx, span in enumerate(spans):
         label = 1.0 if idx == n_spans - 1 else 0.0
         seen_cuts = set()
+        cut_samples = []
         for offset in offsets:
             cut_time = min(span["start"] + offset, span["end"])
             cut_sample = int(cut_time * sr)
             if cut_sample <= 0 or cut_sample in seen_cuts:
                 continue  # dedupe: short spans collapse several offsets to the same cut
             seen_cuts.add(cut_sample)
+            cut_samples.append(cut_sample)
+        if not cut_samples:
+            continue
+        # Split the span's weight evenly across however many offsets survived
+        # dedup, so a short span (fewer distinct cuts) contributes the same total
+        # loss mass as a long one instead of being shortchanged relative to it.
+        example_weight = weight / len(cut_samples)
+        for cut_sample in cut_samples:
             yield {
                 "audio": audio[:cut_sample],
                 "sampling_rate": sr,
                 "label": label,
-                "weight": weight,
+                "weight": example_weight,
                 "language": row["language"],
             }
 
