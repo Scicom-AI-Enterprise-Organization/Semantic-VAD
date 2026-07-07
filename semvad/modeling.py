@@ -174,7 +174,19 @@ class Qwen2AudioEoTClassifier(nn.Module):
         if hasattr(lm, "save_pretrained") and hasattr(lm, "peft_config"):
             lm.save_pretrained(os.path.join(save_dir, "lora"))
 
-    def load_adapter(self, save_dir: str) -> "Qwen2AudioEoTClassifier":
+    def load_adapter(self, save_dir: str, is_trainable: bool = False) -> "Qwen2AudioEoTClassifier":
+        """Load a checkpoint written by `save_adapter`. Call this directly on a
+        plain (non-LoRA-wrapped) model -- do NOT call `apply_lora()` first: the
+        LoRA weights here are attached via `PeftModel.from_pretrained`, which
+        wraps whatever `self.backbone.language_model` currently is, so wrapping
+        an already-LoRA model here nests two adapters and the saved state dict's
+        keys no longer match the nested module paths, so the checkpoint's LoRA
+        weights silently fail to load (peft only warns).
+
+        `is_trainable` must be True to continue training the loaded adapter --
+        `PeftModel.from_pretrained` defaults to `is_trainable=False` (inference
+        mode, `requires_grad=False` on every LoRA param).
+        """
         head_path = os.path.join(save_dir, "eot_head.pt")
         if os.path.exists(head_path):
             self.head.load_state_dict(torch.load(head_path, map_location="cpu"))
@@ -182,7 +194,9 @@ class Qwen2AudioEoTClassifier(nn.Module):
         if os.path.isdir(lora_path):
             from peft import PeftModel
 
-            self.backbone.language_model = PeftModel.from_pretrained(self.backbone.language_model, lora_path)
+            self.backbone.language_model = PeftModel.from_pretrained(
+                self.backbone.language_model, lora_path, is_trainable=is_trainable
+            )
         return self
 
     # ---- single-clip convenience path (used by the eot-harness adapter and the

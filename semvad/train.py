@@ -83,6 +83,9 @@ class DataArguments:
     streaming: bool = dataclasses.field(
         default=True, metadata={"help": "stream from the hub instead of downloading the full config up front"}
     )
+    eval_streaming: bool = dataclasses.field(
+        default=True, metadata={"help": "stream from the hub instead of downloading the full config up front"} 
+    )
     max_audio_seconds: float = dataclasses.field(default=16.0)
     max_eval_examples: int = dataclasses.field(
         default=512, metadata={"help": "cap eval-set size -- the full validation split is itself ~78k turns"}
@@ -169,16 +172,19 @@ def main():
         head_config=EoTHeadConfig(head_hidden_size=model_args.head_hidden_size, dropout=model_args.head_dropout),
         attn_implementation=model_args.attn_implementation,
     )
-    if model_args.use_lora:
+    if model_args.resume_adapter:
+        # Load the saved LoRA config + weights directly onto the plain backbone
+        # instead of calling `apply_lora()` first -- see `load_adapter`'s
+        # docstring for why stacking a fresh adapter under a resumed one is wrong.
+        logger.info("Resuming training from adapter checkpoint %s", model_args.resume_adapter)
+        model.load_adapter(model_args.resume_adapter, is_trainable=True)
+    elif model_args.use_lora:
         model.apply_lora(
             r=model_args.lora_r,
             lora_alpha=model_args.lora_alpha,
             lora_dropout=model_args.lora_dropout,
             target_modules=[m.strip() for m in model_args.lora_target_modules.split(",") if m.strip()],
         )
-    if model_args.resume_adapter:
-        logger.info("Resuming training from adapter checkpoint %s", model_args.resume_adapter)
-        model.load_adapter(model_args.resume_adapter)
 
     n_total = model.count_parameters()
     n_trainable = model.count_parameters(trainable_only=True)
@@ -198,7 +204,7 @@ def main():
             data_args.eval_dataset_path or data_args.dataset_path,
             data_args.eval_dataset_name or data_args.dataset_name,
             data_args.eval_split,
-            streaming=data_args.streaming,
+            streaming=data_args.eval_streaming,
             num_proc=data_args.dataloader_num_workers_data or None,
         )
         if data_args.max_eval_examples:
