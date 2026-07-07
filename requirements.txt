@@ -9,6 +9,6 @@ numpy
 matplotlib
 gradio>=4.44
 huggingface_hub
-kernels==1.14.0 # For FA2 and FA3 using kernels-community
+kernels==0.14.1 # For FA2 and FA3 using kernels-community
 torchcodec
 torchaudio

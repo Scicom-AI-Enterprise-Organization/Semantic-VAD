@@ -150,11 +150,16 @@ satisfies `eot_harness`'s dataset contract (`id`, `language`, `audio`, `silence_
 harness at it directly, no adapter-side dataset shimming needed:
 
 ```bash
+PYTHONPATH=. EOT_CHECKPOINT_DIR=runs/eot-v1 \
 eot-harness predict --path Scicom-intl/semantic-vad-eot --name en --split test \
   --adapter semvad.eot_adapter:Qwen2AudioEoTAdapter --output-dir output
 eot-harness compute-metrics --predictions output/.../predictions.parquet --output-dir output/.../metrics
 eot-harness compare-models output/scicom-intl__semantic-vad-eot__test__min_silence_100ms/en
 ```
+
+`EOT_CHECKPOINT_DIR` (or the adapter's `checkpoint_dir` constructor arg) must point at the dir a training
+run's `--output_dir` wrote (see `train.sh`) -- without it, `Qwen2AudioEoTAdapter` loads the base model with
+a randomly-initialized head and scores are meaningless.
 
 Run per-language (`--name de|es|fr|...`) and roll up with `compare-languages`. This is our fast
 inner-loop signal during training iteration.

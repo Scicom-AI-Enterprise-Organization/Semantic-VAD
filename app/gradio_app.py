@@ -119,6 +119,7 @@ class SessionState:
     sr: int = 16000
     t0: float = dataclasses.field(default_factory=time.time)
     history: deque = dataclasses.field(default_factory=lambda: deque(maxlen=2000))  # (t, p_eot)
+    last_p_eot: float = 0.0
 
     def append(self, sr: int, chunk: np.ndarray, max_seconds: float = MAX_WINDOW_SECONDS) -> None:
         self.sr = sr
@@ -172,8 +173,12 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         sr, chunk = stream_audio
         state.append(sr, chunk, max_seconds=window_seconds)
 
-        p_eot = predictor.predict_p_eot(state.buffer, state.sr)
         silence = trailing_silence_seconds(state.buffer, state.sr)
+        # TurnPolicy.decide() ignores p_eot entirely while silence == 0 (still "listening"),
+        # so skip the 7B forward pass during active speech -- only score once a pause starts.
+        if silence > 0:
+            state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
+        p_eot = state.last_p_eot
         status = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout).decide(p_eot, silence)
 
         t = time.time() - state.t0
@@ -184,6 +189,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         if status.startswith("end_of_turn"):
             # turn ended -- start listening fresh for the next one
             state.buffer = np.zeros(0, dtype=np.float32)
+            state.last_p_eot = 0.0
 
         return render_plot(state.history, threshold), status_html(status, p_eot, silence), state
 
