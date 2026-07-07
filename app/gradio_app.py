@@ -194,6 +194,10 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
                 infer_start = time.perf_counter()
                 state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
                 state.last_latency_ms = (time.perf_counter() - infer_start) * 1000
+                print(
+                    f"[semvad] inference={state.last_latency_ms:.0f}ms "
+                    f"p_eot={state.last_p_eot:.3f} silence={silence:.2f}s"
+                )
             p_eot = state.last_p_eot
             status = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout).decide(p_eot, silence)
 
