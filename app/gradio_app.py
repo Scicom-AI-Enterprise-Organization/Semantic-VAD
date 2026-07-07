@@ -13,8 +13,8 @@ Two backends:
                       real GPU box for the genuine model.
 
 Usage:
-  python app/gradio_app.py --mock
-  python app/gradio_app.py --checkpoint runs/eot-v1 --device cuda
+  python -m app.gradio_app --mock
+  python -m app.gradio_app --checkpoint runs/eot-v1 --device cuda
 """
 
 from __future__ import annotations
@@ -120,6 +120,7 @@ class SessionState:
     t0: float = dataclasses.field(default_factory=time.time)
     history: deque = dataclasses.field(default_factory=lambda: deque(maxlen=2000))  # (t, p_eot)
     last_p_eot: float = 0.0
+    has_speech: bool = False  # any non-silent frame seen since the last reset -- a turn has actually started
 
     def append(self, sr: int, chunk: np.ndarray, max_seconds: float = MAX_WINDOW_SECONDS) -> None:
         self.sr = sr
@@ -174,12 +175,23 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         state.append(sr, chunk, max_seconds=window_seconds)
 
         silence = trailing_silence_seconds(state.buffer, state.sr)
-        # TurnPolicy.decide() ignores p_eot entirely while silence == 0 (still "listening"),
-        # so skip the 7B forward pass during active speech -- only score once a pause starts.
-        if silence > 0:
-            state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
-        p_eot = state.last_p_eot
-        status = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout).decide(p_eot, silence)
+        buffer_seconds = len(state.buffer) / state.sr if state.sr else 0.0
+        if silence < buffer_seconds:
+            state.has_speech = True
+
+        if not state.has_speech:
+            # buffer is silence only, no speech recorded yet since the last reset -- there's no
+            # turn to end. Training data never has a silence_span with no preceding speech, so
+            # scoring this would be out-of-distribution; skip the forward pass and stay idle.
+            p_eot = 0.0
+            status = "listening"
+        else:
+            # TurnPolicy.decide() ignores p_eot entirely while silence == 0 (still "listening"),
+            # so skip the 7B forward pass during active speech -- only score once a pause starts.
+            if silence > 0:
+                state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
+            p_eot = state.last_p_eot
+            status = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout).decide(p_eot, silence)
 
         t = time.time() - state.t0
         state.history.append((t, p_eot))
@@ -190,6 +202,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             # turn ended -- start listening fresh for the next one
             state.buffer = np.zeros(0, dtype=np.float32)
             state.last_p_eot = 0.0
+            state.has_speech = False
 
         return render_plot(state.history, threshold), status_html(status, p_eot, silence), state
 
