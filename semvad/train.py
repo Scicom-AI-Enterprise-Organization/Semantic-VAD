@@ -81,10 +81,10 @@ class DataArguments:
     train_split: str = dataclasses.field(default="train")
     eval_split: Optional[str] = dataclasses.field(default="validation")
     streaming: bool = dataclasses.field(
-        default=True, metadata={"help": "stream from the hub instead of downloading the full config up front"}
+        default=False, metadata={"help": "stream from the hub instead of downloading the full config up front"}
     )
     eval_streaming: bool = dataclasses.field(
-        default=True, metadata={"help": "stream from the hub instead of downloading the full config up front"} 
+        default=False, metadata={"help": "stream from the hub instead of downloading the full config up front"} 
     )
     max_audio_seconds: float = dataclasses.field(default=16.0)
     max_eval_examples: int = dataclasses.field(
