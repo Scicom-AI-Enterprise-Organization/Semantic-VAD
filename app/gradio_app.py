@@ -120,6 +120,7 @@ class SessionState:
     t0: float = dataclasses.field(default_factory=time.time)
     history: deque = dataclasses.field(default_factory=lambda: deque(maxlen=2000))  # (t, p_eot)
     last_p_eot: float = 0.0
+    last_latency_ms: float = 0.0
     has_speech: bool = False  # any non-silent frame seen since the last reset -- a turn has actually started
 
     def append(self, sr: int, chunk: np.ndarray, max_seconds: float = MAX_WINDOW_SECONDS) -> None:
@@ -154,11 +155,12 @@ def render_plot(history: deque, threshold: float):
     return fig
 
 
-def status_html(status: str, p_eot: float, silence: float) -> str:
+def status_html(status: str, p_eot: float, silence: float, latency_ms: float = 0.0) -> str:
     color = STATUS_COLOR.get(status, "#6b7280")
     return (
         f"<div style='font-size:1.4rem;font-weight:600;color:{color}'>{status.upper()}</div>"
-        f"<div style='color:#6b7280'>p(eot)={p_eot:.3f} &nbsp;|&nbsp; silence={silence:.2f}s</div>"
+        f"<div style='color:#6b7280'>p(eot)={p_eot:.3f} &nbsp;|&nbsp; silence={silence:.2f}s "
+        f"&nbsp;|&nbsp; inference={latency_ms:.0f}ms</div>"
     )
 
 
@@ -189,7 +191,9 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             # TurnPolicy.decide() ignores p_eot entirely while silence == 0 (still "listening"),
             # so skip the 7B forward pass during active speech -- only score once a pause starts.
             if silence > 0:
+                infer_start = time.perf_counter()
                 state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
+                state.last_latency_ms = (time.perf_counter() - infer_start) * 1000
             p_eot = state.last_p_eot
             status = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout).decide(p_eot, silence)
 
@@ -198,16 +202,19 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         while len(state.history) > 1 and t - state.history[0][0] > HISTORY_SECONDS:
             state.history.popleft()
 
+        latency_ms = state.last_latency_ms
+
         if status.startswith("end_of_turn"):
             # turn ended -- start listening fresh for the next one
             state.buffer = np.zeros(0, dtype=np.float32)
             state.last_p_eot = 0.0
+            state.last_latency_ms = 0.0
             state.has_speech = False
 
-        return render_plot(state.history, threshold), status_html(status, p_eot, silence), state
+        return render_plot(state.history, threshold), status_html(status, p_eot, silence, latency_ms), state
 
     def reset_state():
-        return SessionState(), render_plot(deque(), 0.5), status_html("listening", 0.0, 0.0)
+        return SessionState(), render_plot(deque(), 0.5), status_html("listening", 0.0, 0.0, 0.0)
 
     with gr.Blocks(title="Semantic VAD -- live p(EoT)") as demo:
         gr.Markdown(
