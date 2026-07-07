@@ -12,3 +12,4 @@ huggingface_hub
 kernels==0.14.1 # For FA2 and FA3 using kernels-community
 torchcodec
 torchaudio
+wandb

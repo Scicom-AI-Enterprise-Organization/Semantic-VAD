@@ -177,6 +177,7 @@ def main():
             target_modules=[m.strip() for m in model_args.lora_target_modules.split(",") if m.strip()],
         )
     if model_args.resume_adapter:
+        logger.info("Resuming training from adapter checkpoint %s", model_args.resume_adapter)
         model.load_adapter(model_args.resume_adapter)
 
     n_total = model.count_parameters()
