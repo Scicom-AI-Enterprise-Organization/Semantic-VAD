@@ -134,8 +134,13 @@ def compute_metrics(eval_pred) -> dict[str, float]:
     preds = (probs >= 0.5).astype(int)
     metrics = {"accuracy": float((preds == labels.astype(int)).mean())}
     try:
-        from sklearn.metrics import roc_auc_score
+        from sklearn.metrics import f1_score, roc_auc_score
 
+        # `hold` outnumbers `eot` (every turn contributes exactly one `eot` span
+        # but n_spans - 1 `hold` spans, see `iter_causal_examples`), so accuracy
+        # alone can look good while the model misses the minority `eot` class --
+        # f1_score defaults to pos_label=1, i.e. the `eot` class.
+        metrics["f1"] = float(f1_score(labels.astype(int), preds, zero_division=0))
         if len(set(labels.astype(int).tolist())) > 1:
             metrics["auc"] = float(roc_auc_score(labels, probs))
     except ImportError:
