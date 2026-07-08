@@ -34,14 +34,30 @@ labels:            HOLD                                    HOLD                 
 
 | mode | when to use | how holds/eot are decided |
 |------|-------------|---------------------------|
-| **`single`** (preferred) | each source row is already one complete utterance/turn (multilingual sentences; Malaysian *streaming* segments) | every internal gap ≥ `min_silence` is a genuine `hold`; the end of the utterance is a genuine `eot`. Label comes from utterance **structure**, not gap size — so it is not trivially recoverable from silence duration (the whole point of semantic VAD). |
-| **`segment`** | a row is a long continuous monologue (Malaysian *whole*) | split into pseudo-turns wherever a gap ≥ `turn_gap` (the **sweet spot**). Smaller gaps become `hold`, the boundary gap becomes `eot`. |
+| **`single`** | each source row is already one complete utterance (multilingual sentences) | every internal gap ≥ `min_silence` is a genuine `hold`; the end of the utterance is a genuine `eot`. Label comes from utterance **structure**, not gap size. |
+| **`sentence`** (Malaysian) | a punctuated continuous recording (Malaysian *whole*) | split turns at sentence-final punctuation (`. ? !`, with an abbreviation guard), plus a `≥ turn_gap` silence fallback for un-punctuated stretches. Internal pauses → `hold`, the sentence end → `eot`. |
+| **`segment`** | a long monologue with no usable punctuation | split at gaps ≥ `turn_gap` (the **sweet spot** from `analyze`). Labels correlate with gap length — least preferred. |
 
-> ⚠️ **Caveat for `segment` mode.** Because the turn boundary is *defined by* silence
-> duration, labels correlate with gap length there. `single` mode avoids this and yields
-> the higher-quality data. LiveKit sidestepped it entirely by using real dialogues where
-> turn boundaries are known from who-spoke-when; forced-alignment corpora don't have that,
-> so `single` mode (one utterance = one turn) is the closest honest equivalent.
+> ⚠️ **Why not a gap threshold for Malaysian?** Continuous speech has **no bimodal gap
+> valley** (`analyze` returns ~0.4 s, which cuts mid-sentence), so `segment` mode chops turns
+> mid-utterance. The Malaysian transcripts carry real sentence punctuation, so `sentence` mode
+> gives complete-thought turns instead. `segment` remains for un-punctuated corpora, with the
+> caveat that its labels track silence duration.
+
+### Malaysian turn quality (audio endpointing)
+
+A real end-of-turn clip must (1) end at a complete thought and (2) **decay to silence** — not
+cut off mid-word. So for Malaysian, after `sentence` splitting, `turn_to_row`:
+
+- **VAD-trims the tail** (`speech_end_index`, an energy VAD): finds where speech actually ends
+  and keeps only ~0.15 s of the following silence, so a clip never ends on a partial word.
+- **caps trailing/lead-in at the real silence gap** (`eot_guard`) so a clip never reaches into
+  the next or previous word (forced-alignment `word.end` can lag the acoustic end).
+- **drops loud-tailed turns**: if the tail is still loud relative to the clip (music, or the
+  speaker continued with no pause), there's no genuine `eot` silence → the turn is discarded.
+
+This trades quantity for quality: Malaysian song/no-pause segments are dropped so every kept
+turn ends in real silence (verified via tail-RMS ≪ clip-RMS).
 
 ## The model this dataset feeds (semantic-VAD architecture)
 
@@ -159,14 +175,11 @@ Output includes percentiles, a KDE valley estimate, a text histogram, and a
 python -m semantic_vad.build --source multilingual --config english \
     --limit 500 --out data/en.parquet
 
-# Malaysian STT — audio read from the repo's zip archives via HTTP range requests:
+# Malaysian STT — whole-recording audio + sentence turns (the production path). Whole-recording
+# mp3s are downloaded from the repo's zip archives (Xet) and read locally; turns split at
+# sentence punctuation, VAD-trimmed to end in silence, loud-tailed turns dropped:
 python -m semantic_vad.build --source malaysian --config malaysian \
-    --malaysian-mode streaming --limit 500 --out data/ms.parquet \
-    --malaysian-zips malaysian-segment-0-0.zip --malaysian-max-scan 5000
-
-# Force segment-mode splitting of long recordings at a tuned threshold:
-python -m semantic_vad.build --source malaysian --config malaysian \
-    --malaysian-mode whole --mode segment --turn-gap 0.7 --out data/ms_whole.parquet
+    --malaysian-mode whole --mode sentence --turn-gap 1.5 --limit 500 --out data/ms.parquet
 ```
 
 Key flags (all have sensible defaults): `--min-silence 0.1`, `--turn-gap 0.7`,
@@ -200,12 +213,17 @@ write_parquet(iter(rows), "data/en.parquet")          # eot-bench-compatible par
   13 languages, embedded 16 kHz audio, a clean `words` column `{word,start,end}`. One
   sentence per row → `single` mode. **The recommended starting point.**
 - **[malaysia-ai/Malaysian-STT](https://huggingface.co/datasets/malaysia-ai/Malaysian-STT)** —
-  whisper-format timestamp strings in `texts` (parsed by `parse_whisper_timestamps`). Audio
-  lives **inside ~4.9 GB zip archives** (`malaysian-segment-*.zip`, ~345k members each);
-  `semantic_vad.malaysian_audio.ZipAudioResolver` reads individual mp3s over HTTP **range
-  requests** (`remotezip`) — no full-archive download. Use `level=word` rows; `streaming`
-  mode gives natural per-segment turns, `whole` a long recording. Pass `--malaysian-zips`
-  to limit which archives are indexed.
+  whisper-format timestamp strings in `texts` (parsed by `parse_whisper_timestamps`); use
+  `level=word` rows, no `synthetic` subset. Audio lives **inside multi-GB zip archives**
+  (config→prefix map: `parliament`→`parlimen`, `science_english`→`science`).
+  - **Production path = `whole` mode + `sentence` turns.** The `streaming` subset's per-segment
+    mp3s are ASR/VAD chunks (split at ~0.5–0.8 s breath pauses) that end **mid-sentence**, so
+    they make bad `eot` labels. Instead we use the *whole*-recording mp3 + its continuous word
+    timeline and split into turns at sentence punctuation.
+  - Whole-recording mp3s are **downloaded** (Xet, `DownloadZipResolver`) and read locally —
+    far faster than the older per-mp3 range-request path (`ZipAudioResolver`, still available).
+    `--malaysian-n-zips` bounds how many archives to pull; scattered members mean a fraction of
+    each subset streams per archive.
 
 ## Running on RunPod + pushing to HF (full scale)
 
@@ -273,11 +291,13 @@ python -m semantic_vad.training.train \
 semantic_vad/
   schema.py     Word, SilenceSpan, Turn, EOTRow, TurnConfig
   parsers.py    parse_whisper_timestamps (Malaysian), normalize_words (words-list)
-  turns.py      compute_gaps, build_turns  ← the hold/eot labeling logic
+  turns.py      compute_gaps, build_turns (single/sentence/segment modes)  ← hold/eot labeling
   analyze.py    analyze_gaps + `-m semantic_vad.analyze` CLI (sweet spot)
-  audio.py      resample_linear, slice_window (zero-pads), turn_to_row, encode_wav
+  audio.py      resample_linear, slice_window, encode_wav/encode_audio,
+                speech_end_index (energy-VAD tail trim), turn_to_row (trim + loud-tail drop)
   sources.py    iter_multilingual / iter_malaysian streaming adapters
-  malaysian_audio.py  ZipAudioResolver — read mp3s from remote zips via range requests
+  malaysian_audio.py  DownloadZipResolver (download whole zips, read locally) +
+                      ZipAudioResolver (per-mp3 range requests) + config→zip-prefix map
   build.py      build_rows + `-m semantic_vad.build` CLI (writes parquet with pyarrow)
   training/     Whisper→adapter→Qwen3 EOT trainer (GPU, `[train]` extra):
     prompt.py     build_example (marker-first chat), num_audio_tokens  ← torch-free

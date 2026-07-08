@@ -15,17 +15,25 @@ where the **last** span is the true end-of-turn (`eot`) and earlier spans are mi
 - `schema.py` — `Word`, `SilenceSpan`, `Turn`, `EOTRow`, `TurnConfig` (all tunables).
 - `parsers.py` — `parse_whisper_timestamps` (Malaysian `<|t|>word<|t|>` format),
   `normalize_words` (AAdonis `{word,start,end}` list). Fully unit-tested, no network.
-- `turns.py` — **the core logic.** `compute_gaps`, `build_turns`. Two modes:
-  `single` (whole utterance = one turn; internal gaps→hold, end→eot) and
-  `segment` (split a monologue at gaps ≥ `turn_gap`).
+- `turns.py` — **the core logic.** `compute_gaps`, `build_turns`. Three modes:
+  `single` (whole utterance = one turn; internal gaps→hold, end→eot), `segment` (split at
+  gaps ≥ `turn_gap`), and `sentence` (split at sentence-final `. ? !` with an abbreviation
+  guard + a `≥ turn_gap` fallback — **used for Malaysian**; continuous speech has no bimodal
+  gap valley so a gap threshold cuts mid-sentence).
 - `analyze.py` — `analyze_gaps` + `python -m semantic_vad.analyze` CLI. Finds the
-  "sweet spot" gap threshold via a numpy-only KDE valley over log-gaps.
-- `audio.py` — `resample_linear` (to 16 kHz, no librosa), `slice_window` (zero-pads past
-  end so the EOT silence is real), `turn_to_row` (re-zeroes times to the clip).
+  "sweet spot" gap threshold via a numpy-only KDE valley over log-gaps. NOTE: returns ~0.4 s
+  for conversational corpora (no valley) → too small; that's why Malaysian uses `sentence`.
+- `audio.py` — `resample_linear` (16 kHz, no librosa), `slice_window` (zero-pads), `encode_wav`/
+  `encode_audio` (mp3 via lameenc), **`speech_end_index`** (energy VAD — finds where speech
+  ends), and `turn_to_row` which: VAD-trims the tail to end ~0.15 s into silence, caps
+  trailing/lead-in at the real gap (`eot_guard`, never reaches the neighboring word), and
+  **returns `None` to DROP a turn whose tail is still loud** (music / no-pause = no real `eot`
+  silence). `build_rows` skips the `None`s. A row must end in silence.
 - `sources.py` — streaming adapters `iter_multilingual`, `iter_malaysian` + `SOURCES`.
-- `malaysian_audio.py` — `ZipAudioResolver`: Malaysian audio lives in ~4.9 GB zips
-  (`malaysian-segment-*.zip`, ~345k members); read individual mp3s over HTTP range requests
-  with `remotezip` (needs the `malaysian` extra). Index a specific zip via `--malaysian-zips`.
+- `malaysian_audio.py` — audio lives in multi-GB zips. `DownloadZipResolver` (production):
+  download whole-recording zips (Xet) and read mp3s locally. `ZipAudioResolver`: per-mp3 HTTP
+  range requests (`remotezip`, `malaysian` extra). `zip_prefix()` maps config→archive prefix
+  (`parliament`→`parlimen`, `science_english`→`science`); members are scattered across zips.
 - `build.py` — `build_rows` + `python -m semantic_vad.build` CLI → writes parquet **directly
   with pyarrow**, audio as WAV bytes + embedded HF `Audio(16kHz)` feature metadata. Do NOT
   use `datasets.Dataset.from_list`/`push_to_hub` for audio — datasets>=5 imports
@@ -71,9 +79,10 @@ asked for: **no LoRA** (full fine-tune), **flash-attention varlen** packing (`cu
 
 - **AAdonis/multilingual_audio_alignments** — 13 langs, embedded 16 kHz audio, clean
   `words`. One sentence/row → `single` mode. **Primary, fully validated path.**
-- **malaysia-ai/Malaysian-STT** — whisper-format `texts`, audio in separate mp3s
-  (`audio_filenames`, lazily `hf_hub_download`ed + soundfile-decoded). Use `level=word`;
-  `streaming` mode = natural per-segment turns, `whole` = long recording (`segment` mode).
+- **malaysia-ai/Malaysian-STT** — whisper-format `texts`, `level=word`, **no synthetic subset**.
+  Build with **`whole` mode + `sentence` turns** (production): the `streaming` per-segment mp3s
+  are ASR chunks that end mid-sentence (bad `eot`), so use the whole-recording mp3 + continuous
+  word timeline and split at punctuation. Audio downloaded via `DownloadZipResolver`.
 
 ## RUNNING — use RunPod, NOT the laptop
 
@@ -116,6 +125,17 @@ python3 deploy/runpod_ctl.py terminate           # tear down when done (stops bi
 - **Malaysian audio** = whole zips downloaded (Xet) via `DownloadZipResolver`, read locally
   (≫ per-mp3 range request). Zips shared across shard workers (reused if already on disk).
   Bump `N_ZIPS` for big subsets (imda/dialects) if they're streaming-bound (low member hit-rate).
+- **Malaysian re-run** (`deploy/pod_ms_redo.sh`): rebuild Malaysian only — deletes old `ms_*`
+  shards, per subset predownloads a few *whole* zips then runs `CONC` sharded `pod_scale_big.py`
+  workers in **`whole`+`sentence`** mode (`MS_MODE=whole MS_TURN_MODE=sentence TURN_GAP=1.5`),
+  then `pod_ms_split.py` splits each subset's last shard 50/25/25 into `data/{train,validation,
+  test}/`. Multilingual untouched. Verify with `deploy/pod_ms_verify.py` — it reports **tail RMS**
+  (must be ≪ clip RMS = ends in silence). Loud-tailed turns are dropped, so Malaysian counts
+  shrank (quality-over-quantity): e.g. dialects train 30 shards (was ~70).
+- **Final dataset** `Scicom-intl/semantic-vad-eot`: 19 configs (`all`, 13 langs, 5 `ms_*`
+  subsets), each `train`/`validation`/`test` (last shard split 50/25/25). Card = `pod_finalize.py`
+  or a hand-uploaded README with `configs:` + `data_files` globs (`data/*.parquet`,
+  `data/valid|train|test/...`); shard filenames don't match HF auto-detect, so the card is required.
 - **Xet**: `pip install hf_xet` + `HF_XET_HIGH_PERFORMANCE=1` for fast HF transfer.
 - Tar the repo with `COPYFILE_DISABLE=1 tar ... --exclude='._*'`; extract with `--no-same-owner`
   (macOS xattrs otherwise make GNU tar exit non-zero under `set -e`).
@@ -137,5 +157,8 @@ them network-free — the heavy training code (modeling/data/train) needs the `[
 
 - eot-bench rule is positional: **do not store hold/eot labels**; keep `silence_spans`
   time-ordered with the EOT last.
-- Prefer `single` mode; document any `segment`-mode use (labels correlate with gap size).
+- Turn mode by corpus: `single` for one-utterance rows (multilingual), `sentence` for
+  punctuated recordings (Malaysian), `segment` only as a last resort (labels track gap size).
+- **A turn's clip must end in silence** — `turn_to_row` VAD-trims the tail and drops turns
+  that end loud. If you see a clip ending mid-word, check `speech_end_index` / `max_tail_ratio`.
 - No heavyweight audio deps — `soundfile` covers wav+mp3; resampling is numpy linear.
