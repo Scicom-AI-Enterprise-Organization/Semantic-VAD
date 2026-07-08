@@ -93,6 +93,18 @@ class DataArguments:
     dataloader_num_workers_data: int = dataclasses.field(
         default=0, metadata={"help": "num_proc for non-streaming .map() during example expansion"}
     )
+    train_singleton_keep_prob: float = dataclasses.field(
+        default=1.0,
+        metadata={
+            "help": (
+                "keep-probability for TRAIN turns with exactly one silence span (eot-only, "
+                "no hold). These turns are the majority and, because example weight is "
+                "1/n_spans per turn, push the effective eot:hold loss-weight ratio to ~75:25 "
+                "-- well past the raw span-count split. Lower this (e.g. 0.15-0.3) to correct "
+                "the imbalance; 1.0 (default) disables downsampling. Never applied to eval."
+            )
+        },
+    )
 
 
 class EoTTrainer(Trainer):
@@ -201,6 +213,7 @@ def main():
         data_args.train_split,
         streaming=data_args.streaming,
         num_proc=data_args.dataloader_num_workers_data or None,
+        singleton_keep_prob=data_args.train_singleton_keep_prob,
     )
 
     eval_dataset = None

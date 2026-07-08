@@ -16,6 +16,7 @@ enhancement, not required for a first model.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 from typing import Any, Iterator, Optional
 
 import numpy as np
@@ -24,6 +25,17 @@ import torch
 from semvad.modeling import AUDIO_PROMPT_PREFIX
 
 EOT_INSTRUCTION = "Has the speaker finished their turn? Answer yes or no."
+
+
+def _stable_unit_interval(key: str) -> float:
+    """Deterministic pseudo-random value in [0, 1) derived from `key`.
+
+    Unlike `random.random()`, this is stable across processes/workers/map-shards --
+    the same turn is always kept or dropped the same way no matter which
+    dataloader worker or `.map()` shard happens to process it.
+    """
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
 
 # Seconds into each silence span at which to cut the audio. Multiple offsets per
 # span teach the model that confidence should rise monotonically the longer a
@@ -36,12 +48,27 @@ TRUNCATION_OFFSETS: tuple[float, ...] = (0.0, 0.2, 0.6, 1.2)
 def iter_causal_examples(
     row: dict[str, Any],
     offsets: tuple[float, ...] = TRUNCATION_OFFSETS,
+    singleton_keep_prob: float = 1.0,
 ) -> Iterator[dict[str, Any]]:
     """One dataset row (one full user turn) -> zero or more causal training
     examples, one per (silence_span, truncation_offset). The last span (sorted by
-    `start`) is `eot`; every earlier span is `hold`."""
+    `start`) is `eot`; every earlier span is `hold`.
+
+    `singleton_keep_prob` downsamples turns with exactly one silence span --
+    i.e. turns that contribute an `eot` example and *zero* `hold` examples.
+    These are the majority of turns (~56% in en/train) and, because `weight =
+    1/n_spans` below gives every turn equal total loss weight regardless of span
+    count, they alone push the corpus's effective eot:hold loss-weight ratio to
+    roughly 75:25 -- well past the raw ~60:40 span-count split, and the opposite
+    direction from eval benchmarks that skew hold-majority. Dropping a fixed
+    fraction of singleton turns (keyed by `row["id"]`, not `random`, so it's
+    reproducible regardless of worker/shard) corrects that bias without
+    touching any multi-span turn's hold examples.
+    """
     spans = sorted(row["silence_spans"], key=lambda s: s["start"])
     if not spans:
+        return
+    if len(spans) == 1 and singleton_keep_prob < 1.0 and _stable_unit_interval(row["id"]) >= singleton_keep_prob:
         return
     audio = row["audio"]["array"]
     sr = row["audio"]["sampling_rate"]
@@ -74,18 +101,21 @@ def iter_causal_examples(
             }
 
 
-def expand_to_causal_examples(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+def expand_to_causal_examples(
+    batch: dict[str, list[Any]], singleton_keep_prob: float = 1.0
+) -> dict[str, list[Any]]:
     """`datasets.Dataset.map(..., batched=True, remove_columns=...)` callback.
 
     Rows-out != rows-in (each input turn fans out into several span examples),
     which `datasets` batched map supports natively for both `Dataset` and
-    `IterableDataset`.
+    `IterableDataset`. `singleton_keep_prob` is forwarded to `iter_causal_examples`
+    -- see its docstring for why single-span turns get downsampled.
     """
     out: dict[str, list[Any]] = {"audio": [], "sampling_rate": [], "label": [], "weight": [], "language": []}
     n = len(batch["id"])
     for i in range(n):
         row = {key: batch[key][i] for key in batch}
-        for example in iter_causal_examples(row):
+        for example in iter_causal_examples(row, singleton_keep_prob=singleton_keep_prob):
             for key, value in example.items():
                 out[key].append(value)
     return out
@@ -140,14 +170,23 @@ def load_causal_dataset(
     split: str,
     streaming: bool = True,
     num_proc: Optional[int] = None,
+    singleton_keep_prob: float = 1.0,
 ):
     """Load `Scicom-intl/semantic-vad-eot` (or a compatible dataset) and expand it
     into per-span causal examples. Streaming avoids materializing the ~150GB
-    `all` config; use `streaming=False` + a small `name`/split for fast iteration."""
+    `all` config; use `streaming=False` + a small `name`/split for fast iteration.
+
+    `singleton_keep_prob` (default 1.0, i.e. no-op) downsamples single-silence-span
+    turns -- see `iter_causal_examples`'s docstring. Leave at 1.0 for eval datasets,
+    which should reflect the natural distribution."""
     from datasets import load_dataset
 
     dataset = load_dataset(path, name=name, split=split, streaming=streaming)
-    map_kwargs = {"batched": True, "remove_columns": dataset.column_names}
+    map_kwargs = {
+        "batched": True,
+        "remove_columns": dataset.column_names,
+        "fn_kwargs": {"singleton_keep_prob": singleton_keep_prob},
+    }
     if not streaming and num_proc:
         map_kwargs["num_proc"] = num_proc
     return dataset.map(expand_to_causal_examples, **map_kwargs)
