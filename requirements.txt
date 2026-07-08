@@ -1,5 +1,4 @@
-torch==2.10
-torchaudio==2.10.0
+torch>=2.12
 transformers==5.12.0
 peft>=0.13
 accelerate>=0.34
@@ -12,4 +11,5 @@ gradio>=4.44
 huggingface_hub
 kernels==0.14.1 # For FA2 and FA3 using kernels-community
 torchcodec
+torchaudio
 wandb
