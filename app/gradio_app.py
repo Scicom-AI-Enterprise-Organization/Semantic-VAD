@@ -267,7 +267,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
     def run_on_upload(uploaded_audio, threshold, action_delay, timeout):
         empty_fig = render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), threshold, [])
         if uploaded_audio is None:
-            return empty_fig, status_html("listening", 0.0, 0.0)
+            return empty_fig, status_html("listening", 0.0, 0.0), gr.update()
 
         sr, audio = uploaded_audio
         audio = np.asarray(audio, dtype=np.float32)
@@ -320,7 +320,23 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
                 state.has_speech = False
 
         fig = render_spectrogram_with_cutoff(audio, sr, state.history, threshold, cutoff_times)
-        return fig, status_html(status, p_eot, silence, latency_ms)
+
+        # mirror the same cutoffs as captions on the audio player itself, so scrubbing/playing
+        # the upload surfaces "EOT" right when playback crosses a cutoff -- same timestamps as
+        # the vertical lines on the spectrogram above, just correlated to the waveform directly
+        subtitles = [
+            {"text": f"EOT #{idx + 1}", "timestamp": [max(0.0, ct - 0.1), ct + 0.1]}
+            for idx, ct in enumerate(cutoff_times)
+        ]
+        annotated_audio = gr.Audio(
+            value=(sr, audio),
+            sources=["upload"],
+            type="numpy",
+            label="Audio file",
+            subtitles=subtitles,
+        )
+
+        return fig, status_html(status, p_eot, silence, latency_ms), annotated_audio
 
     with gr.Blocks(title="Semantic VAD -- live p(EoT)") as demo:
         gr.Markdown(
@@ -367,7 +383,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         run_btn.click(
             run_on_upload,
             inputs=[upload_audio, threshold, action_delay, timeout],
-            outputs=[upload_plot, upload_status],
+            outputs=[upload_plot, upload_status, upload_audio],
         )
 
     return demo
