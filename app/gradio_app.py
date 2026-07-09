@@ -160,7 +160,7 @@ def render_spectrogram_with_cutoff(
     sr: int,
     history: deque,
     threshold: float,
-    cutoff_time: Optional[float],
+    cutoff_times: list[float],
 ):
     import matplotlib.pyplot as plt
 
@@ -183,13 +183,13 @@ def render_spectrogram_with_cutoff(
     ax_p.set_xlabel("time (s)")
     ax_p.legend(loc="upper left", fontsize=8)
 
-    if cutoff_time is not None:
+    for cutoff_time in cutoff_times:
         for ax in (ax_spec, ax_p):
             ax.axvline(cutoff_time, color="#16a34a", linestyle="--", linewidth=1.5)
         ax_spec.text(
             cutoff_time,
             ax_spec.get_ylim()[1] * 0.95,
-            f"  end_of_turn @ {cutoff_time:.2f}s",
+            f"  eot @ {cutoff_time:.2f}s",
             color="#16a34a",
             fontsize=8,
             va="top",
@@ -265,7 +265,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         return SessionState(), render_plot(deque(), 0.5), status_html("listening", 0.0, 0.0, 0.0)
 
     def run_on_upload(uploaded_audio, threshold, action_delay, timeout):
-        empty_fig = render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), threshold, None)
+        empty_fig = render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), threshold, [])
         if uploaded_audio is None:
             return empty_fig, status_html("listening", 0.0, 0.0)
 
@@ -282,9 +282,11 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         chunk_len = max(1, int(sr * chunk_seconds))
         n_chunks = int(np.ceil(len(audio) / chunk_len)) if audio.size else 0
 
-        cutoff_time = None
+        cutoff_times = []
         status, p_eot, silence, latency_ms = "listening", 0.0, 0.0, 0.0
 
+        # keep scoring the entire recording, not just up to the first end_of_turn -- a
+        # single upload may contain several turns, each with its own cutoff to mark
         for i in range(n_chunks):
             chunk = audio[i * chunk_len : (i + 1) * chunk_len]
             state.append(sr, chunk, max_seconds=window_seconds)
@@ -310,11 +312,14 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             latency_ms = state.last_latency_ms
 
             if status.startswith("end_of_turn"):
-                # first end-of-turn decision -- this is the cutoff point shown on the spectrogram
-                cutoff_time = t
-                break
+                cutoff_times.append(t)
+                # turn ended -- start listening fresh for the next one, same as live mic
+                state.buffer = np.zeros(0, dtype=np.float32)
+                state.last_p_eot = 0.0
+                state.last_latency_ms = 0.0
+                state.has_speech = False
 
-        fig = render_spectrogram_with_cutoff(audio, sr, state.history, threshold, cutoff_time)
+        fig = render_spectrogram_with_cutoff(audio, sr, state.history, threshold, cutoff_times)
         return fig, status_html(status, p_eot, silence, latency_ms)
 
     with gr.Blocks(title="Semantic VAD -- live p(EoT)") as demo:
@@ -348,7 +353,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
                     with gr.Column(scale=2):
                         upload_status = gr.HTML(status_html("listening", 0.0, 0.0))
                         upload_plot = gr.Plot(
-                            render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), 0.5, None),
+                            render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), 0.5, []),
                             label="Spectrogram + p(eot) with end-of-turn cutoff",
                         )
 
