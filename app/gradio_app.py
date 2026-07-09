@@ -155,6 +155,50 @@ def render_plot(history: deque, threshold: float):
     return fig
 
 
+def render_spectrogram_with_cutoff(
+    audio: np.ndarray,
+    sr: int,
+    history: deque,
+    threshold: float,
+    cutoff_time: Optional[float],
+):
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+    fig, (ax_spec, ax_p) = plt.subplots(
+        2, 1, figsize=(7, 5), sharex=True, gridspec_kw={"height_ratios": [2, 1]}
+    )
+    if audio.size >= 2:
+        nfft = min(512, max(32, 1 << int(np.log2(max(2, len(audio) // 4)))))
+        ax_spec.specgram(audio, Fs=sr, NFFT=nfft, noverlap=nfft // 2, cmap="magma")
+    ax_spec.set_ylabel("Hz")
+    ax_spec.set_title("Uploaded audio -- spectrogram")
+
+    if history:
+        ts, ps = zip(*history)
+        ax_p.plot(ts, ps, color="#4f46e5", linewidth=2)
+    ax_p.axhline(threshold, color="#ef4444", linestyle="--", linewidth=1, label="threshold")
+    ax_p.set_ylim(-0.05, 1.05)
+    ax_p.set_ylabel("p(eot)")
+    ax_p.set_xlabel("time (s)")
+    ax_p.legend(loc="upper left", fontsize=8)
+
+    if cutoff_time is not None:
+        for ax in (ax_spec, ax_p):
+            ax.axvline(cutoff_time, color="#16a34a", linestyle="--", linewidth=1.5)
+        ax_spec.text(
+            cutoff_time,
+            ax_spec.get_ylim()[1] * 0.95,
+            f"  end_of_turn @ {cutoff_time:.2f}s",
+            color="#16a34a",
+            fontsize=8,
+            va="top",
+        )
+
+    fig.tight_layout()
+    return fig
+
+
 def status_html(status: str, p_eot: float, silence: float, latency_ms: float = 0.0) -> str:
     color = STATUS_COLOR.get(status, "#6b7280")
     return (
@@ -220,6 +264,59 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
     def reset_state():
         return SessionState(), render_plot(deque(), 0.5), status_html("listening", 0.0, 0.0, 0.0)
 
+    def run_on_upload(uploaded_audio, threshold, action_delay, timeout):
+        empty_fig = render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), threshold, None)
+        if uploaded_audio is None:
+            return empty_fig, status_html("listening", 0.0, 0.0)
+
+        sr, audio = uploaded_audio
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=-1)
+        if audio.size and np.max(np.abs(audio)) > 4.0:
+            audio = audio / 32768.0
+
+        state = SessionState(sr=sr)
+        policy = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout)
+        chunk_seconds = 0.3
+        chunk_len = max(1, int(sr * chunk_seconds))
+        n_chunks = int(np.ceil(len(audio) / chunk_len)) if audio.size else 0
+
+        cutoff_time = None
+        status, p_eot, silence, latency_ms = "listening", 0.0, 0.0, 0.0
+
+        for i in range(n_chunks):
+            chunk = audio[i * chunk_len : (i + 1) * chunk_len]
+            state.append(sr, chunk, max_seconds=window_seconds)
+            t = (i + 1) * chunk_seconds
+
+            silence = trailing_silence_seconds(state.buffer, state.sr)
+            buffer_seconds = len(state.buffer) / state.sr if state.sr else 0.0
+            if silence < buffer_seconds:
+                state.has_speech = True
+
+            if not state.has_speech:
+                p_eot = 0.0
+                status = "listening"
+            else:
+                if silence > 0:
+                    infer_start = time.perf_counter()
+                    state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
+                    state.last_latency_ms = (time.perf_counter() - infer_start) * 1000
+                p_eot = state.last_p_eot
+                status = policy.decide(p_eot, silence)
+
+            state.history.append((t, p_eot))
+            latency_ms = state.last_latency_ms
+
+            if status.startswith("end_of_turn"):
+                # first end-of-turn decision -- this is the cutoff point shown on the spectrogram
+                cutoff_time = t
+                break
+
+        fig = render_spectrogram_with_cutoff(audio, sr, state.history, threshold, cutoff_time)
+        return fig, status_html(status, p_eot, silence, latency_ms)
+
     with gr.Blocks(title="Semantic VAD -- live p(EoT)") as demo:
         gr.Markdown(
             "## Semantic VAD -- live end-of-turn probability\n"
@@ -229,15 +326,31 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         )
         state = gr.State(SessionState())
         with gr.Row():
-            with gr.Column(scale=1):
-                mic = gr.Audio(sources=["microphone"], streaming=True, type="numpy", label="Microphone")
-                clear_btn = gr.Button("Reset session")
-                threshold = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="threshold")
-                action_delay = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="action_delay (s)")
-                timeout = gr.Slider(0.5, 6.0, value=3.0, step=0.1, label="timeout (s)")
-            with gr.Column(scale=2):
-                status = gr.HTML(status_html("listening", 0.0, 0.0))
-                plot = gr.Plot(render_plot(deque(), 0.5))
+            threshold = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="threshold")
+            action_delay = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="action_delay (s)")
+            timeout = gr.Slider(0.5, 6.0, value=3.0, step=0.1, label="timeout (s)")
+
+        with gr.Tabs():
+            with gr.Tab("Live microphone"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        mic = gr.Audio(sources=["microphone"], streaming=True, type="numpy", label="Microphone")
+                        clear_btn = gr.Button("Reset session")
+                    with gr.Column(scale=2):
+                        status = gr.HTML(status_html("listening", 0.0, 0.0))
+                        plot = gr.Plot(render_plot(deque(), 0.5))
+
+            with gr.Tab("Upload audio"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        upload_audio = gr.Audio(sources=["upload"], type="numpy", label="Audio file")
+                        run_btn = gr.Button("Run prediction", variant="primary")
+                    with gr.Column(scale=2):
+                        upload_status = gr.HTML(status_html("listening", 0.0, 0.0))
+                        upload_plot = gr.Plot(
+                            render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), 0.5, None),
+                            label="Spectrogram + p(eot) with end-of-turn cutoff",
+                        )
 
         mic.stream(
             on_chunk,
@@ -246,6 +359,11 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             stream_every=0.3,
         )
         clear_btn.click(reset_state, outputs=[state, plot, status])
+        run_btn.click(
+            run_on_upload,
+            inputs=[upload_audio, threshold, action_delay, timeout],
+            outputs=[upload_plot, upload_status],
+        )
 
     return demo
 
