@@ -49,16 +49,19 @@ class Qwen2AudioEoTAdapter:
         checkpoint_dir = checkpoint_dir or os.environ.get("EOT_CHECKPOINT_DIR")
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model = Qwen2AudioEoTClassifier.from_pretrained(model_name, dtype=dtype)
+        self._classifier = Qwen2AudioEoTClassifier.from_pretrained(model_name, dtype=dtype)
         if checkpoint_dir:
-            self.model.load_adapter(checkpoint_dir)
-        self.model.to(device)
-        self.model.eval()
+            self._classifier.load_adapter(checkpoint_dir)
+        self._classifier.to(device)
+        self._classifier.eval()
 
         self.processor = AutoProcessor.from_pretrained(model_name)
         self.processor.tokenizer.padding_side = "right"
         self._supported_languages = supported_languages or TRAINED_LANGUAGES
         self.transcript_lag = transcript_lag
+        # Kept as a plain string (not the torch module) so the harness can embed
+        # it in the streaming run manifest -- see _streaming_prediction_config.
+        self.model = model_name
 
     def supports_language(self, lang_code: str) -> bool:
         return lang_code in self._supported_languages
@@ -67,7 +70,7 @@ class Qwen2AudioEoTAdapter:
         audio = item["audio"]
         messages = item.get("messages") or []
         prior_text = " ".join(m["content"] for m in messages if m.get("role") == "user")
-        return self.model.predict_p_eot(
+        return self._classifier.predict_p_eot(
             self.processor,
             audio["array"],
             audio["sampling_rate"],
@@ -104,7 +107,7 @@ class Qwen2AudioEoTAdapter:
             end_sample = int(math.floor(timestamp * sample_rate + _EPS))
             messages = build_messages(row, timestamp, transcript_lag=self.transcript_lag)
             prior_text = " ".join(m["content"] for m in messages if m.get("role") == "user")
-            p_eot = self.model.predict_p_eot(
+            p_eot = self._classifier.predict_p_eot(
                 self.processor,
                 array[:end_sample],
                 sample_rate,
