@@ -37,6 +37,8 @@ import torch
 from transformers import AutoProcessor, HfArgumentParser, Trainer, TrainingArguments
 
 from semvad.data import EoTCollator, load_causal_dataset
+from semvad.degrade import TelephonyDegrader
+from semvad.metrics import compute_classification_metrics
 from semvad.modeling import DEFAULT_MODEL_NAME, EoTHeadConfig, Qwen2AudioEoTClassifier
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,22 @@ class DataArguments:
             )
         },
     )
+    telephony_augment: bool = dataclasses.field(
+        default=False,
+        metadata={
+            "help": (
+                "simulate a call-centre telephony channel (narrowband + GSM/mu-law codec + "
+                "line noise, see semvad/degrade.py) on TRAIN audio -- matches the deployment "
+                "channel for this model. Never applied to eval."
+            )
+        },
+    )
+    telephony_apply_prob: float = dataclasses.field(
+        default=0.7, metadata={"help": "fraction of train turns the telephony channel is applied to"}
+    )
+    telephony_packet_loss_prob: float = dataclasses.field(
+        default=0.0, metadata={"help": "probability of additionally zeroing a few short VoIP-dropout chunks"}
+    )
 
 
 class EoTTrainer(Trainer):
@@ -143,21 +161,7 @@ def compute_metrics(eval_pred) -> dict[str, float]:
     logits = np.asarray(logits).reshape(-1)
     labels = np.asarray(labels).reshape(-1)
     probs = 1.0 / (1.0 + np.exp(-logits))
-    preds = (probs >= 0.5).astype(int)
-    metrics = {"accuracy": float((preds == labels.astype(int)).mean())}
-    try:
-        from sklearn.metrics import f1_score, roc_auc_score
-
-        # `hold` outnumbers `eot` (every turn contributes exactly one `eot` span
-        # but n_spans - 1 `hold` spans, see `iter_causal_examples`), so accuracy
-        # alone can look good while the model misses the minority `eot` class --
-        # f1_score defaults to pos_label=1, i.e. the `eot` class.
-        metrics["f1"] = float(f1_score(labels.astype(int), preds, zero_division=0))
-        if len(set(labels.astype(int).tolist())) > 1:
-            metrics["auc"] = float(roc_auc_score(labels, probs))
-    except ImportError:
-        pass
-    return metrics
+    return compute_classification_metrics(probs, labels)
 
 
 def main():
@@ -207,6 +211,18 @@ def main():
     n_trainable = model.count_parameters(trainable_only=True)
     logger.info("trainable params: %s / %s (%.3f%%)", f"{n_trainable:,}", f"{n_total:,}", 100 * n_trainable / n_total)
 
+    degrader = None
+    if data_args.telephony_augment:
+        degrader = TelephonyDegrader(
+            apply_prob=data_args.telephony_apply_prob,
+            packet_loss_prob=data_args.telephony_packet_loss_prob,
+        )
+        logger.info(
+            "Telephony channel augmentation enabled: apply_prob=%.2f packet_loss_prob=%.2f",
+            data_args.telephony_apply_prob,
+            data_args.telephony_packet_loss_prob,
+        )
+
     train_dataset = load_causal_dataset(
         data_args.dataset_path,
         data_args.dataset_name,
@@ -214,6 +230,7 @@ def main():
         streaming=data_args.streaming,
         num_proc=data_args.dataloader_num_workers_data or None,
         singleton_keep_prob=data_args.train_singleton_keep_prob,
+        degrader=degrader,
     )
 
     eval_dataset = None

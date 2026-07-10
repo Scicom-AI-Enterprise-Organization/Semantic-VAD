@@ -22,6 +22,7 @@ from typing import Any, Iterator, Optional
 import numpy as np
 import torch
 
+from semvad.degrade import TelephonyDegrader
 from semvad.modeling import AUDIO_PROMPT_PREFIX
 
 EOT_INSTRUCTION = "Has the speaker finished their turn? Answer yes or no."
@@ -49,6 +50,7 @@ def iter_causal_examples(
     row: dict[str, Any],
     offsets: tuple[float, ...] = TRUNCATION_OFFSETS,
     singleton_keep_prob: float = 1.0,
+    degrader: Optional[TelephonyDegrader] = None,
 ) -> Iterator[dict[str, Any]]:
     """One dataset row (one full user turn) -> zero or more causal training
     examples, one per (silence_span, truncation_offset). The last span (sorted by
@@ -64,6 +66,12 @@ def iter_causal_examples(
     fraction of singleton turns (keyed by `row["id"]`, not `random`, so it's
     reproducible regardless of worker/shard) corrects that bias without
     touching any multi-span turn's hold examples.
+
+    `degrader`, if given, runs the deployment-matching call-centre channel
+    simulation (see `semvad/degrade.py`) once on the *whole turn's* audio before
+    any span is cut -- a real phone channel's distortion profile is constant
+    for the duration of a call, so every causal example derived from this turn
+    shares one degraded realization instead of each getting an independent one.
     """
     spans = sorted(row["silence_spans"], key=lambda s: s["start"])
     if not spans:
@@ -72,6 +80,8 @@ def iter_causal_examples(
         return
     audio = row["audio"]["array"]
     sr = row["audio"]["sampling_rate"]
+    if degrader is not None:
+        audio = degrader.degrade(audio, sr)
     n_spans = len(spans)
     weight = 1.0 / n_spans  # a turn with many hesitations shouldn't dominate `hold`
     for idx, span in enumerate(spans):
@@ -102,20 +112,22 @@ def iter_causal_examples(
 
 
 def expand_to_causal_examples(
-    batch: dict[str, list[Any]], singleton_keep_prob: float = 1.0
+    batch: dict[str, list[Any]],
+    singleton_keep_prob: float = 1.0,
+    degrader: Optional[TelephonyDegrader] = None,
 ) -> dict[str, list[Any]]:
     """`datasets.Dataset.map(..., batched=True, remove_columns=...)` callback.
 
     Rows-out != rows-in (each input turn fans out into several span examples),
     which `datasets` batched map supports natively for both `Dataset` and
-    `IterableDataset`. `singleton_keep_prob` is forwarded to `iter_causal_examples`
-    -- see its docstring for why single-span turns get downsampled.
+    `IterableDataset`. `singleton_keep_prob` and `degrader` are forwarded to
+    `iter_causal_examples` -- see its docstring.
     """
     out: dict[str, list[Any]] = {"audio": [], "sampling_rate": [], "label": [], "weight": [], "language": []}
     n = len(batch["id"])
     for i in range(n):
         row = {key: batch[key][i] for key in batch}
-        for example in iter_causal_examples(row, singleton_keep_prob=singleton_keep_prob):
+        for example in iter_causal_examples(row, singleton_keep_prob=singleton_keep_prob, degrader=degrader):
             for key, value in example.items():
                 out[key].append(value)
     return out
@@ -171,21 +183,24 @@ def load_causal_dataset(
     streaming: bool = True,
     num_proc: Optional[int] = None,
     singleton_keep_prob: float = 1.0,
+    degrader: Optional[TelephonyDegrader] = None,
 ):
     """Load `Scicom-intl/semantic-vad-eot` (or a compatible dataset) and expand it
     into per-span causal examples. Streaming avoids materializing the ~150GB
     `all` config; use `streaming=False` + a small `name`/split for fast iteration.
 
     `singleton_keep_prob` (default 1.0, i.e. no-op) downsamples single-silence-span
-    turns -- see `iter_causal_examples`'s docstring. Leave at 1.0 for eval datasets,
-    which should reflect the natural distribution."""
+    turns -- see `iter_causal_examples`'s docstring. `degrader`, if given, runs the
+    call-centre channel simulation (`semvad/degrade.py`) on every turn's audio.
+    Leave both at their no-op defaults for eval datasets, which should reflect the
+    natural, undistorted distribution."""
     from datasets import load_dataset
 
     dataset = load_dataset(path, name=name, split=split, streaming=streaming)
     map_kwargs = {
         "batched": True,
         "remove_columns": dataset.column_names,
-        "fn_kwargs": {"singleton_keep_prob": singleton_keep_prob},
+        "fn_kwargs": {"singleton_keep_prob": singleton_keep_prob, "degrader": degrader},
     }
     if not streaming and num_proc:
         map_kwargs["num_proc"] = num_proc
