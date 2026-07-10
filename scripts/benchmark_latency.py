@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=10, help="timed calls per duration")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default=None, help="optional path to dump results as JSON")
+    parser.add_argument("--attn_implementation", default="sdpa")
     args = parser.parse_args()
 
     from transformers import AutoProcessor
@@ -110,7 +111,7 @@ def main():
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
     print(f"[bench] loading {args.model_name} ({args.dtype}) on {args.device} ...")
-    model = Qwen2AudioEoTClassifier.from_pretrained(args.model_name, dtype=dtype)
+    model = Qwen2AudioEoTClassifier.from_pretrained(args.model_name, dtype=dtype, attn_implementation=args.attn_implementation)
     if args.checkpoint:
         model.load_adapter(args.checkpoint)
     model.to(args.device)
