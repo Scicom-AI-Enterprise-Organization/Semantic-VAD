@@ -6,3 +6,10 @@ __pycache__/
 venv/
 *.egg-info/
 .claude/settings.local.json
+.env
+.pytest_cache/
+data/
+*.parquet
+deploy/runpod_key
+deploy/runpod_key.pub
+deploy/pod.json

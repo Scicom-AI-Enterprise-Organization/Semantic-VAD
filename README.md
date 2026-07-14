@@ -9,6 +9,13 @@ methodology LiveKit uses in [`eot-bench`](https://github.com/livekit/eot-bench) 
 See [`PLAN.md`](PLAN.md) for the original design doc (problem framing, data schema, milestones).
 This document describes the system as built.
 
+This repo also carries the dataset-builder project that produces the training data below
+(`Scicom-intl/semantic-vad-eot`) from forced-alignment corpora — see
+[`semantic_vad/README.md`](semantic_vad/README.md) for how that dataset is built (word-gap
+turn segmentation, Malaysian-source handling, RunPod build pipeline) and for an earlier,
+alternative model design (Whisper→adapter→Qwen3, marker-token read) that this repo's `semvad/`
+model superseded with a Qwen2-Audio + classification-head approach instead.
+
 ## How it works
 
 - **Backbone**: [`Qwen/Qwen2-Audio-7B-Instruct`](https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct)

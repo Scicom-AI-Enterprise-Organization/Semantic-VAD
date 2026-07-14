@@ -1,0 +1,106 @@
+"""One scale worker (env-driven). Runs ON the pod; a launcher spawns many in parallel.
+
+Builds one unit of work -- a whole multilingual language, or one shard of a Malaysian
+subset -- writing fixed-size mp3 parquet shards, uploading each to HF, deleting locally
+(so the 20 GB disk never fills).
+
+Env:
+  HF_TOKEN     (required)
+  SVAD_REPO    target repo (default Scicom-intl/semantic-vad-eot)
+  KIND         "ml" (multilingual) | "ms" (Malaysian)
+  CONFIG       language (ml) or subset (ms)
+  LIMIT        max rows this worker emits
+  AUDIO_FORMAT default mp3
+  SHARD_ROWS   rows per uploaded shard (default 20000)
+  KEY          filename key for uploaded shards (default {KIND}-{CONFIG})
+  # Malaysian only:
+  N_ZIPS       archives to use (default 3)
+  ZIP_WORKDIR  dir holding pre-downloaded zips (shared across shards)
+  SHARD_IDX / SHARD_CNT   partition the row stream across parallel shard workers
+"""
+
+import gc
+import itertools
+import os
+import sys
+import time
+
+sys.path.insert(0, "/root/semantic-vad")
+from semantic_vad.build import build_rows, write_parquet  # noqa: E402
+from semantic_vad.malaysian_audio import discover_zip_names, zip_prefix  # noqa: E402
+from semantic_vad.schema import TurnConfig  # noqa: E402
+
+TOKEN = os.environ["HF_TOKEN"]
+REPO = os.environ.get("SVAD_REPO", "Scicom-intl/semantic-vad-eot")
+KIND = os.environ["KIND"]
+CONFIG = os.environ["CONFIG"]
+LIMIT = int(os.environ["LIMIT"])
+AUDIO_FORMAT = os.environ.get("AUDIO_FORMAT", "mp3")
+SHARD_ROWS = int(os.environ.get("SHARD_ROWS", "20000"))
+KEY = os.environ.get("KEY", f"{KIND}-{CONFIG}")
+DATA = "/root/data"
+os.makedirs(DATA, exist_ok=True)
+
+
+def make_rows():
+    if KIND == "ml":
+        return build_rows("multilingual", CONFIG, TurnConfig(mode="single"), mode="auto",
+                          limit=LIMIT, streaming=True, hf_token=TOKEN)
+    # Malaysian: whole-recording audio + word timeline, split into turns at sentence-final
+    # punctuation (with a >= turn_gap silence fallback). Segments-as-turns cut mid-sentence.
+    ms_mode = os.environ.get("MS_MODE", "whole")            # whole recording audio
+    turn_mode = os.environ.get("MS_TURN_MODE", "sentence")   # punctuation + gap fallback
+    turn_gap = float(os.environ.get("TURN_GAP", "1.5"))
+    n_zips = int(os.environ.get("N_ZIPS", "4"))
+    workdir = os.environ.get("ZIP_WORKDIR", f"{DATA}/zips-{CONFIG}")
+    zips = discover_zip_names(zip_prefix(CONFIG, ms_mode), token=TOKEN)[:n_zips]
+    shard = None
+    if os.environ.get("SHARD_CNT"):
+        shard = (int(os.environ["SHARD_IDX"]), int(os.environ["SHARD_CNT"]))
+    cfg = TurnConfig(mode=turn_mode, turn_gap=turn_gap, min_silence=0.1)
+    # limit=None here: one whole recording yields many turns (and some are dropped by the
+    # loud-tail filter), so we cap emitted TURNS in main() via islice instead of recordings.
+    return build_rows("malaysian", CONFIG, cfg, mode=turn_mode,
+                      limit=None, streaming=True, hf_token=TOKEN,
+                      malaysian_mode=ms_mode, malaysian_zips=zips,
+                      malaysian_backend="download", malaysian_n_zips=n_zips,
+                      malaysian_workdir=workdir, malaysian_in_ram=False,
+                      malaysian_shard=shard, malaysian_max_scan=50_000_000)
+
+
+def main():
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=TOKEN)
+    suffix = f"-s{os.environ.get('SHARD_IDX')}" if os.environ.get("SHARD_CNT") else ""
+    t0 = time.time()
+    total = 0
+    # One persistent generator; write_parquet streams up to SHARD_ROWS per shard (256-row
+    # batches internally), so raw audio arrays are never bulk-buffered -> bounded memory.
+    # islice caps this worker at LIMIT *turns* (post-drop), so subset totals land near target.
+    gen = itertools.islice(make_rows(), LIMIT)
+    si = 0
+    while True:
+        shard_path = f"{DATA}/{KEY}{suffix}-{si:05d}.parquet"
+        n = write_parquet(gen, shard_path, audio_format=AUDIO_FORMAT, max_rows=SHARD_ROWS)
+        if n == 0:
+            break
+        dst = f"data/{KEY}{suffix}-{si:05d}.parquet"
+        api.upload_file(path_or_fileobj=shard_path, repo_id=REPO, repo_type="dataset",
+                        path_in_repo=dst)
+        os.remove(shard_path)
+        total += n
+        rate = total / max(1e-9, time.time() - t0)
+        print(f"[{KEY}{suffix}] shard {si} +{n} -> {dst} | total={total} ({rate:.1f} rows/s)",
+              flush=True)
+        si += 1
+        gc.collect()
+        if n < SHARD_ROWS:  # generator exhausted mid-shard
+            break
+    print(f"[{KEY}{suffix}] DONE total={total} in {time.time()-t0:.0f}s", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+    sys.stdout.flush()
+    os._exit(0)
