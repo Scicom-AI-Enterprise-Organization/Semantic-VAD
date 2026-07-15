@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
 from typing import Any, Iterator, Optional
 
 import numpy as np
@@ -193,7 +194,13 @@ def load_causal_dataset(
     turns -- see `iter_causal_examples`'s docstring. `degrader`, if given, runs the
     call-centre channel simulation (`semvad/degrade.py`) on every turn's audio.
     Leave both at their no-op defaults for eval datasets, which should reflect the
-    natural, undistorted distribution."""
+    natural, undistorted distribution.
+
+    `num_proc` controls `.map()` multiprocessing for non-streaming datasets: the
+    default `None` auto-picks `os.cpu_count() // 2` worker processes, `0` disables
+    multiprocessing (single process), and a positive int uses that many workers.
+    Ignored when `streaming=True` (`datasets` doesn't support `num_proc` for
+    `IterableDataset.map()`)."""
     from datasets import load_dataset
 
     dataset = load_dataset(path, name=name, split=split, streaming=streaming)
@@ -202,6 +209,8 @@ def load_causal_dataset(
         "remove_columns": dataset.column_names,
         "fn_kwargs": {"singleton_keep_prob": singleton_keep_prob, "degrader": degrader},
     }
-    if not streaming and num_proc:
-        map_kwargs["num_proc"] = num_proc
+    if not streaming:
+        resolved_num_proc = (os.cpu_count() or 2) // 2 if num_proc is None else num_proc
+        if resolved_num_proc:
+            map_kwargs["num_proc"] = resolved_num_proc
     return dataset.map(expand_to_causal_examples, **map_kwargs)

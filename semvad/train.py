@@ -92,8 +92,15 @@ class DataArguments:
     max_eval_examples: int = dataclasses.field(
         default=512, metadata={"help": "cap eval-set size -- the full validation split is itself ~78k turns"}
     )
-    dataloader_num_workers_data: int = dataclasses.field(
-        default=0, metadata={"help": "num_proc for non-streaming .map() during example expansion"}
+    dataloader_num_workers_data: Optional[int] = dataclasses.field(
+        default=None,
+        metadata={
+            "help": (
+                "num_proc for non-streaming .map() during example expansion. Defaults to "
+                "cpu_count()//2; pass 0 to disable multiprocessing (single process), or a "
+                "positive int to use that many worker processes."
+            )
+        },
     )
     train_singleton_keep_prob: float = dataclasses.field(
         default=1.0,
@@ -228,7 +235,7 @@ def main():
         data_args.dataset_name,
         data_args.train_split,
         streaming=data_args.streaming,
-        num_proc=data_args.dataloader_num_workers_data or None,
+        num_proc=data_args.dataloader_num_workers_data,
         singleton_keep_prob=data_args.train_singleton_keep_prob,
         degrader=degrader,
     )
@@ -240,7 +247,7 @@ def main():
             data_args.eval_dataset_name or data_args.dataset_name,
             data_args.eval_split,
             streaming=data_args.eval_streaming,
-            num_proc=data_args.dataloader_num_workers_data or None,
+            num_proc=data_args.dataloader_num_workers_data,
         )
         if data_args.max_eval_examples:
             if data_args.streaming:
