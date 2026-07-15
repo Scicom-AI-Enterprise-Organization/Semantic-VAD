@@ -27,9 +27,10 @@ from typing import Optional
 
 import numpy as np
 
-MAX_WINDOW_SECONDS = 16.0  # causal audio context kept for scoring (bounded, per README §6)
+MAX_WINDOW_SECONDS = 30.0  # causal audio context kept for scoring (bounded, per README §6)
 HISTORY_SECONDS = 30.0  # length of the p(eot) trace shown on the plot
 SILENCE_RMS_DBFS = -40.0  # energy threshold below which a frame counts as "silence"
+MIN_SPEECH_SECONDS = 0.2  # a voiced run shorter than this is a noise blip/mic pop, not real speech
 
 
 def rms_dbfs(chunk: np.ndarray) -> float:
@@ -50,6 +51,29 @@ def trailing_silence_seconds(audio: np.ndarray, sr: int, frame_ms: float = 20.0)
             break
         silence += frame_ms / 1000
     return silence
+
+
+def has_sustained_speech(
+    audio: np.ndarray, sr: int, frame_ms: float = 20.0, min_speech_seconds: float = MIN_SPEECH_SECONDS
+) -> bool:
+    """True once `audio` contains a contiguous run of non-silent frames at least
+    `min_speech_seconds` long. A single frame above `SILENCE_RMS_DBFS` (mic pop,
+    a click, ambient noise flickering across the threshold) is not enough --
+    without this debounce, `SessionState.has_speech` could latch on a noise blip
+    and arm the end-of-turn timeout on pure silence."""
+    frame_len = max(1, int(sr * frame_ms / 1000))
+    n_frames = len(audio) // frame_len
+    needed = max(1, int(round(min_speech_seconds * 1000 / frame_ms)))
+    run = 0
+    for i in range(n_frames):
+        frame = audio[i * frame_len : (i + 1) * frame_len]
+        if rms_dbfs(frame) > SILENCE_RMS_DBFS:
+            run += 1
+            if run >= needed:
+                return True
+        else:
+            run = 0
+    return False
 
 
 class MockPredictor:
@@ -121,7 +145,7 @@ class SessionState:
     history: deque = dataclasses.field(default_factory=lambda: deque(maxlen=2000))  # (t, p_eot)
     last_p_eot: float = 0.0
     last_latency_ms: float = 0.0
-    has_speech: bool = False  # any non-silent frame seen since the last reset -- a turn has actually started
+    has_speech: bool = False  # a *sustained* voiced run seen since the last reset -- a turn has actually started
 
     def append(self, sr: int, chunk: np.ndarray, max_seconds: float = MAX_WINDOW_SECONDS) -> None:
         self.sr = sr
@@ -221,14 +245,15 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         state.append(sr, chunk, max_seconds=window_seconds)
 
         silence = trailing_silence_seconds(state.buffer, state.sr)
-        buffer_seconds = len(state.buffer) / state.sr if state.sr else 0.0
-        if silence < buffer_seconds:
+        if not state.has_speech and has_sustained_speech(state.buffer, state.sr):
             state.has_speech = True
 
         if not state.has_speech:
-            # buffer is silence only, no speech recorded yet since the last reset -- there's no
-            # turn to end. Training data never has a silence_span with no preceding speech, so
-            # scoring this would be out-of-distribution; skip the forward pass and stay idle.
+            # buffer has no sustained voiced run yet since the last reset -- there's no turn to
+            # end. Training data never has a silence_span with no preceding speech, so scoring
+            # this would be out-of-distribution; skip the forward pass and stay idle. This also
+            # keeps a long stretch of pure silence (or noise blips too short to be real speech)
+            # from ever arming the timeout and firing spurious end-of-turns.
             p_eot = 0.0
             status = "listening"
         else:
@@ -293,8 +318,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             t = (i + 1) * chunk_seconds
 
             silence = trailing_silence_seconds(state.buffer, state.sr)
-            buffer_seconds = len(state.buffer) / state.sr if state.sr else 0.0
-            if silence < buffer_seconds:
+            if not state.has_speech and has_sustained_speech(state.buffer, state.sr):
                 state.has_speech = True
 
             if not state.has_speech:
