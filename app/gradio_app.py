@@ -299,8 +299,14 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
         audio = np.asarray(audio, dtype=np.float32)
         if audio.ndim > 1:
             audio = audio.mean(axis=-1)
-        if audio.size and np.max(np.abs(audio)) > 4.0:
-            audio = audio / 32768.0
+        # Peak-normalize the whole file once, rather than assuming int16 full-scale range:
+        # Gradio decodes uploads at their original recording gain (no loudness normalization),
+        # so a genuinely quiet recording can sit below the fixed `SILENCE_RMS_DBFS` threshold
+        # for its entire duration -- `has_speech` would then never latch and no eot would ever
+        # fire, even though the file clearly alternates between speech and silence.
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        if peak > 1e-6:
+            audio = audio / peak * 0.95
 
         state = SessionState(sr=sr)
         policy = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout)
