@@ -134,6 +134,7 @@ STATUS_COLOR = {
     "holding": "#d97706",
     "end_of_turn": "#16a34a",
     "end_of_turn (timeout)": "#16a34a",
+    "end_of_turn (end of recording)": "#16a34a",
 }
 
 
@@ -342,6 +343,15 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
                 state.last_p_eot = 0.0
                 state.last_latency_ms = 0.0
                 state.has_speech = False
+
+        if state.has_speech and silence > 0 and not status.startswith("end_of_turn"):
+            # the recording ran out mid-pause without `policy` ever crossing threshold/timeout --
+            # most uploads just stop shortly after the speaker stops talking rather than being
+            # padded with several seconds of trailing silence, so without this the last (often
+            # only) turn in the file would never get an eot cutoff at all. There's no more audio
+            # to wait on, so the pause in progress *is* the end of this turn.
+            status = "end_of_turn (end of recording)"
+            cutoff_times.append(len(audio) / sr)
 
         fig = render_spectrogram_with_cutoff(audio, sr, state.history, threshold, cutoff_times)
 
