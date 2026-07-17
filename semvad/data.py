@@ -213,4 +213,11 @@ def load_causal_dataset(
         resolved_num_proc = (os.cpu_count() or 2) // 2 if num_proc is None else num_proc
         if resolved_num_proc:
             map_kwargs["num_proc"] = resolved_num_proc
+        # `audio` is a list-of-float32 column and pyarrow's ListArray offsets are
+        # int32. Causal examples aren't length-capped until collate time, so a
+        # writer buffer holding the default 1000 rows of (possibly long) audio
+        # can overflow 2**31 total samples before it flushes. Flush much more
+        # often to keep any single buffer well under that limit.
+        map_kwargs["writer_batch_size"] = 64
+        map_kwargs["batch_size"] = 64
     return dataset.map(expand_to_causal_examples, **map_kwargs)

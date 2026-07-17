@@ -29,8 +29,9 @@ import numpy as np
 
 MAX_WINDOW_SECONDS = 30.0  # causal audio context kept for scoring (bounded, per README §6)
 HISTORY_SECONDS = 30.0  # length of the p(eot) trace shown on the plot
-SILENCE_RMS_DBFS = -40.0  # energy threshold below which a frame counts as "silence"
+SILENCE_RMS_DBFS = -80.0  # energy threshold below which a frame counts as "silence"
 MIN_SPEECH_SECONDS = 0.2  # a voiced run shorter than this is a noise blip/mic pop, not real speech
+MIN_SILENCE_SECONDS = 0.1  # trailing silence shorter than this is a plosive/breath dip mid-utterance, not a real pause
 
 
 def rms_dbfs(chunk: np.ndarray) -> float:
@@ -40,24 +41,30 @@ def rms_dbfs(chunk: np.ndarray) -> float:
     return 20.0 * np.log10(rms + 1e-9)
 
 
-def trailing_silence_seconds(audio: np.ndarray, sr: int, frame_ms: float = 20.0) -> float:
+def trailing_silence_seconds(
+    audio: np.ndarray, sr: int, frame_ms: float = 20.0, silence_threshold: float = SILENCE_RMS_DBFS
+) -> float:
     """Seconds of trailing audio below the silence energy threshold."""
     frame_len = max(1, int(sr * frame_ms / 1000))
     n_frames = len(audio) // frame_len
     silence = 0.0
     for i in range(n_frames - 1, -1, -1):
         frame = audio[i * frame_len : (i + 1) * frame_len]
-        if rms_dbfs(frame) > SILENCE_RMS_DBFS:
+        if rms_dbfs(frame) > silence_threshold:
             break
         silence += frame_ms / 1000
     return silence
 
 
 def has_sustained_speech(
-    audio: np.ndarray, sr: int, frame_ms: float = 20.0, min_speech_seconds: float = MIN_SPEECH_SECONDS
+    audio: np.ndarray,
+    sr: int,
+    frame_ms: float = 20.0,
+    min_speech_seconds: float = MIN_SPEECH_SECONDS,
+    silence_threshold: float = SILENCE_RMS_DBFS,
 ) -> bool:
     """True once `audio` contains a contiguous run of non-silent frames at least
-    `min_speech_seconds` long. A single frame above `SILENCE_RMS_DBFS` (mic pop,
+    `min_speech_seconds` long. A single frame above `silence_threshold` (mic pop,
     a click, ambient noise flickering across the threshold) is not enough --
     without this debounce, `SessionState.has_speech` could latch on a noise blip
     and arm the end-of-turn timeout on pure silence."""
@@ -67,7 +74,7 @@ def has_sustained_speech(
     run = 0
     for i in range(n_frames):
         frame = audio[i * frame_len : (i + 1) * frame_len]
-        if rms_dbfs(frame) > SILENCE_RMS_DBFS:
+        if rms_dbfs(frame) > silence_threshold:
             run += 1
             if run >= needed:
                 return True
@@ -144,6 +151,7 @@ class SessionState:
     sr: int = 16000
     t0: float = dataclasses.field(default_factory=time.time)
     history: deque = dataclasses.field(default_factory=lambda: deque(maxlen=2000))  # (t, p_eot)
+    rms_history: deque = dataclasses.field(default_factory=lambda: deque(maxlen=2000))  # (t, rms_dbfs)
     last_p_eot: float = 0.0
     last_latency_ms: float = 0.0
     has_speech: bool = False  # a *sustained* voiced run seen since the last reset -- a turn has actually started
@@ -180,18 +188,37 @@ def render_plot(history: deque, threshold: float):
     return fig
 
 
+def render_rms_plot(rms_history: deque, silence_threshold: float = SILENCE_RMS_DBFS):
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+    fig, ax = plt.subplots(figsize=(6, 2.5))
+    if rms_history:
+        ts, rs = zip(*rms_history)
+        ax.plot(ts, rs, color="#0891b2", linewidth=2)
+    ax.axhline(silence_threshold, color="#ef4444", linestyle="--", linewidth=1, label="silence threshold")
+    ax.set_ylim(-100.0, 5.0)
+    ax.set_ylabel("rms (dBFS)")
+    ax.set_xlabel("time (s)")
+    ax.legend(loc="upper left", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
 def render_spectrogram_with_cutoff(
     audio: np.ndarray,
     sr: int,
     history: deque,
     threshold: float,
     cutoff_times: list[float],
+    rms_history: deque | None = None,
+    silence_threshold: float = SILENCE_RMS_DBFS,
 ):
     import matplotlib.pyplot as plt
 
     plt.close("all")
-    fig, (ax_spec, ax_p) = plt.subplots(
-        2, 1, figsize=(7, 5), sharex=True, gridspec_kw={"height_ratios": [2, 1]}
+    fig, (ax_spec, ax_p, ax_rms) = plt.subplots(
+        3, 1, figsize=(7, 7), sharex=True, gridspec_kw={"height_ratios": [2, 1, 1]}
     )
     if audio.size >= 2:
         nfft = min(512, max(32, 1 << int(np.log2(max(2, len(audio) // 4)))))
@@ -205,11 +232,19 @@ def render_spectrogram_with_cutoff(
     ax_p.axhline(threshold, color="#ef4444", linestyle="--", linewidth=1, label="threshold")
     ax_p.set_ylim(-0.05, 1.05)
     ax_p.set_ylabel("p(eot)")
-    ax_p.set_xlabel("time (s)")
     ax_p.legend(loc="upper left", fontsize=8)
 
+    if rms_history:
+        ts, rs = zip(*rms_history)
+        ax_rms.plot(ts, rs, color="#0891b2", linewidth=2)
+    ax_rms.axhline(silence_threshold, color="#ef4444", linestyle="--", linewidth=1, label="silence threshold")
+    ax_rms.set_ylim(-100.0, 5.0)
+    ax_rms.set_ylabel("rms (dBFS)")
+    ax_rms.set_xlabel("time (s)")
+    ax_rms.legend(loc="upper left", fontsize=8)
+
     for cutoff_time in cutoff_times:
-        for ax in (ax_spec, ax_p):
+        for ax in (ax_spec, ax_p, ax_rms):
             ax.axvline(cutoff_time, color="#16a34a", linestyle="--", linewidth=1.5)
         ax_spec.text(
             cutoff_time,
@@ -236,17 +271,24 @@ def status_html(status: str, p_eot: float, silence: float, latency_ms: float = 0
 def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
     import gradio as gr
 
-    def on_chunk(stream_audio, state, threshold, action_delay, timeout):
+    def on_chunk(stream_audio, state, threshold, action_delay, timeout, silence_threshold):
         if state is None:
             state = SessionState()
         if stream_audio is None:
-            return render_plot(state.history, threshold), status_html("listening", 0.0, 0.0), state
+            return (
+                render_plot(state.history, threshold),
+                render_rms_plot(state.rms_history, silence_threshold),
+                status_html("listening", 0.0, 0.0),
+                state,
+            )
 
         sr, chunk = stream_audio
+        n_samples = np.asarray(chunk).shape[0]
         state.append(sr, chunk, max_seconds=window_seconds)
+        chunk_rms = rms_dbfs(state.buffer[-n_samples:]) if n_samples else -120.0
 
-        silence = trailing_silence_seconds(state.buffer, state.sr)
-        if not state.has_speech and has_sustained_speech(state.buffer, state.sr):
+        silence = trailing_silence_seconds(state.buffer, state.sr, silence_threshold=silence_threshold)
+        if not state.has_speech and has_sustained_speech(state.buffer, state.sr, silence_threshold=silence_threshold):
             state.has_speech = True
 
         if not state.has_speech:
@@ -256,25 +298,42 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             # keeps a long stretch of pure silence (or noise blips too short to be real speech)
             # from ever arming the timeout and firing spurious end-of-turns.
             p_eot = 0.0
+            state.last_p_eot = 0.0
+            status = "listening"
+        elif silence <= 0:
+            # actively speaking right now -- no live pause to score. Reset rather than carry
+            # forward a stale p(eot) from an earlier pause: it no longer applies once speech
+            # has resumed, and displaying it makes the trace look like it's above threshold
+            # when nothing is actually being evaluated.
+            p_eot = 0.0
+            state.last_p_eot = 0.0
+            state.last_latency_ms = 0.0
+            status = "listening"
+        elif silence < MIN_SILENCE_SECONDS:
+            # trailing dip is too short to be a real pause (plosive closure, breath, mic noise
+            # flickering below the silence threshold for a frame or two) -- don't score it yet.
+            p_eot = 0.0
+            state.last_p_eot = 0.0
+            state.last_latency_ms = 0.0
             status = "listening"
         else:
-            # TurnPolicy.decide() ignores p_eot entirely while silence == 0 (still "listening"),
-            # so skip the 7B forward pass during active speech -- only score once a pause starts.
-            if silence > 0:
-                infer_start = time.perf_counter()
-                state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
-                state.last_latency_ms = (time.perf_counter() - infer_start) * 1000
-                print(
-                    f"[semvad] inference={state.last_latency_ms:.0f}ms "
-                    f"p_eot={state.last_p_eot:.3f} silence={silence:.2f}s"
-                )
+            infer_start = time.perf_counter()
+            state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
+            state.last_latency_ms = (time.perf_counter() - infer_start) * 1000
+            print(
+                f"[semvad] inference={state.last_latency_ms:.0f}ms "
+                f"p_eot={state.last_p_eot:.3f} silence={silence:.2f}s"
+            )
             p_eot = state.last_p_eot
             status = TurnPolicy(threshold=threshold, action_delay=action_delay, timeout=timeout).decide(p_eot, silence)
 
         t = time.time() - state.t0
         state.history.append((t, p_eot))
+        state.rms_history.append((t, chunk_rms))
         while len(state.history) > 1 and t - state.history[0][0] > HISTORY_SECONDS:
             state.history.popleft()
+        while len(state.rms_history) > 1 and t - state.rms_history[0][0] > HISTORY_SECONDS:
+            state.rms_history.popleft()
 
         latency_ms = state.last_latency_ms
 
@@ -285,13 +344,25 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             state.last_latency_ms = 0.0
             state.has_speech = False
 
-        return render_plot(state.history, threshold), status_html(status, p_eot, silence, latency_ms), state
+        return (
+            render_plot(state.history, threshold),
+            render_rms_plot(state.rms_history, silence_threshold),
+            status_html(status, p_eot, silence, latency_ms),
+            state,
+        )
 
-    def reset_state():
-        return SessionState(), render_plot(deque(), 0.5), status_html("listening", 0.0, 0.0, 0.0)
+    def reset_state(silence_threshold):
+        return (
+            SessionState(),
+            render_plot(deque(), 0.5),
+            render_rms_plot(deque(), silence_threshold),
+            status_html("listening", 0.0, 0.0, 0.0),
+        )
 
-    def run_on_upload(uploaded_audio, threshold, action_delay, timeout):
-        empty_fig = render_spectrogram_with_cutoff(np.zeros(0, dtype=np.float32), 16000, deque(), threshold, [])
+    def run_on_upload(uploaded_audio, threshold, action_delay, timeout, silence_threshold):
+        empty_fig = render_spectrogram_with_cutoff(
+            np.zeros(0, dtype=np.float32), 16000, deque(), threshold, [], deque(), silence_threshold
+        )
         if uploaded_audio is None:
             return empty_fig, status_html("listening", 0.0, 0.0), gr.update()
 
@@ -323,19 +394,33 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             chunk = audio[i * chunk_len : (i + 1) * chunk_len]
             state.append(sr, chunk, max_seconds=window_seconds)
             t = (i + 1) * chunk_seconds
+            state.rms_history.append((t, rms_dbfs(chunk)))
 
-            silence = trailing_silence_seconds(state.buffer, state.sr)
-            if not state.has_speech and has_sustained_speech(state.buffer, state.sr):
+            silence = trailing_silence_seconds(state.buffer, state.sr, silence_threshold=silence_threshold)
+            if not state.has_speech and has_sustained_speech(state.buffer, state.sr, silence_threshold=silence_threshold):
                 state.has_speech = True
 
             if not state.has_speech:
                 p_eot = 0.0
+                state.last_p_eot = 0.0
+                status = "listening"
+            elif silence <= 0:
+                # actively speaking right now -- reset rather than carry forward a stale
+                # p(eot) from an earlier pause (see on_chunk for the full rationale).
+                p_eot = 0.0
+                state.last_p_eot = 0.0
+                state.last_latency_ms = 0.0
+                status = "listening"
+            elif silence < MIN_SILENCE_SECONDS:
+                # too short to be a real pause (plosive/breath dip) -- don't score it yet.
+                p_eot = 0.0
+                state.last_p_eot = 0.0
+                state.last_latency_ms = 0.0
                 status = "listening"
             else:
-                if silence > 0:
-                    infer_start = time.perf_counter()
-                    state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
-                    state.last_latency_ms = (time.perf_counter() - infer_start) * 1000
+                infer_start = time.perf_counter()
+                state.last_p_eot = predictor.predict_p_eot(state.buffer, state.sr)
+                state.last_latency_ms = (time.perf_counter() - infer_start) * 1000
                 p_eot = state.last_p_eot
                 status = policy.decide(p_eot, silence)
 
@@ -359,7 +444,9 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             status = "end_of_turn (end of recording)"
             cutoff_times.append(len(audio) / sr)
 
-        fig = render_spectrogram_with_cutoff(audio, sr, state.history, threshold, cutoff_times)
+        fig = render_spectrogram_with_cutoff(
+            audio, sr, state.history, threshold, cutoff_times, state.rms_history, silence_threshold
+        )
 
         # mirror the same cutoffs as captions on the audio player itself, so scrubbing/playing
         # the upload surfaces "EOT" right when playback crosses a cutoff -- same timestamps as
@@ -390,6 +477,9 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
             threshold = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="threshold")
             action_delay = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="action_delay (s)")
             timeout = gr.Slider(0.5, 6.0, value=3.0, step=0.1, label="timeout (s)")
+            silence_threshold = gr.Slider(
+                -100.0, -5.0, value=SILENCE_RMS_DBFS, step=1.0, label="silence_rms_dbfs"
+            )
 
         with gr.Tabs():
             with gr.Tab("Live microphone"):
@@ -400,6 +490,7 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
                     with gr.Column(scale=2):
                         status = gr.HTML(status_html("listening", 0.0, 0.0))
                         plot = gr.Plot(render_plot(deque(), 0.5))
+                        rms_plot = gr.Plot(render_rms_plot(deque()))
 
             with gr.Tab("Upload audio"):
                 with gr.Row():
@@ -415,14 +506,14 @@ def build_demo(predictor, window_seconds: float = MAX_WINDOW_SECONDS):
 
         mic.stream(
             on_chunk,
-            inputs=[mic, state, threshold, action_delay, timeout],
-            outputs=[plot, status, state],
+            inputs=[mic, state, threshold, action_delay, timeout, silence_threshold],
+            outputs=[plot, rms_plot, status, state],
             stream_every=0.3,
         )
-        clear_btn.click(reset_state, outputs=[state, plot, status])
+        clear_btn.click(reset_state, inputs=[silence_threshold], outputs=[state, plot, rms_plot, status])
         run_btn.click(
             run_on_upload,
-            inputs=[upload_audio, threshold, action_delay, timeout],
+            inputs=[upload_audio, threshold, action_delay, timeout, silence_threshold],
             outputs=[upload_plot, upload_status, upload_audio],
         )
 
