@@ -16,7 +16,8 @@ is the right shape, exactly like Option A's collator.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
+import logging
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -26,6 +27,15 @@ from whisper_qwen3_head.prompt import EOT_INSTRUCTION, SpecialIds, build_prompt_
 # Re-exported for convenience -- callers only need to import from this module for the full
 # training-data pipeline (dataset loading lives in `semvad.data`, unchanged).
 from semvad.data import TRUNCATION_OFFSETS, iter_causal_examples, load_causal_dataset  # noqa: F401
+
+logger = logging.getLogger(__name__)
+
+# Whisper's feature extractor always mels into a fixed 3000-frame / 30s window
+# (`WhisperFeatureExtractor.chunk_length`); anything longer than that is silently
+# truncated by the feature extractor itself with no signal back to the caller, which
+# would desync a hold/eot label from the audio the model actually sees. Examples longer
+# than this are dropped entirely (see `EoTCollator.__call__`) rather than fed in truncated.
+WHISPER_MAX_AUDIO_SECONDS = 30.0
 
 
 @dataclasses.dataclass
@@ -58,7 +68,14 @@ class EoTCollator:
             audio = audio[-max_len:]
         return audio
 
-    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def __call__(self, examples: list[dict[str, Any]]) -> Optional[dict[str, torch.Tensor]]:
+        kept = [ex for ex in examples if len(ex["audio"]) / ex["sampling_rate"] <= WHISPER_MAX_AUDIO_SECONDS]
+        if len(kept) < len(examples):
+            logger.debug("dropped %d/%d examples longer than %.0fs", len(examples) - len(kept), len(examples), WHISPER_MAX_AUDIO_SECONDS)
+        examples = kept
+        if not examples:
+            return None
+
         audios = [self._load_audio(ex) for ex in examples]
         feat = self.feature_extractor(
             audios,
