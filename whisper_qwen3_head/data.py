@@ -69,14 +69,18 @@ class EoTCollator:
         return audio
 
     def __call__(self, examples: list[dict[str, Any]]) -> Optional[dict[str, torch.Tensor]]:
-        kept = [ex for ex in examples if len(ex["audio"]) / ex["sampling_rate"] <= WHISPER_MAX_AUDIO_SECONDS]
+        # Filter on the *truncated* (post-`_load_audio`) length, not the raw example
+        # length -- `_load_audio` already truncates to `self.max_audio_seconds`, so an
+        # example that's long before truncation is often perfectly fine afterwards.
+        # Only drop what's still too long for Whisper's fixed 30s window even after
+        # truncation (i.e. `max_audio_seconds` itself exceeds `WHISPER_MAX_AUDIO_SECONDS`).
+        loaded = [(ex, self._load_audio(ex)) for ex in examples]
+        kept = [(ex, audio) for ex, audio in loaded if len(audio) / self.feature_extractor.sampling_rate <= WHISPER_MAX_AUDIO_SECONDS]
         if len(kept) < len(examples):
             logger.debug("dropped %d/%d examples longer than %.0fs", len(examples) - len(kept), len(examples), WHISPER_MAX_AUDIO_SECONDS)
-        examples = kept
-        if not examples:
+        if not kept:
             return None
-
-        audios = [self._load_audio(ex) for ex in examples]
+        examples, audios = (list(t) for t in zip(*kept))
         feat = self.feature_extractor(
             audios,
             sampling_rate=self.feature_extractor.sampling_rate,
