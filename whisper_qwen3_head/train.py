@@ -51,6 +51,7 @@ from semvad.modeling import EoTHeadConfig
 from semvad.train import DataArguments  # identical dataset pipeline as Option A -- see semvad/data.py
 from whisper_qwen3_head.data import EoTCollator, load_causal_dataset
 from whisper_qwen3_head.modeling import DEFAULT_QWEN3_NAME, DEFAULT_WHISPER_NAME, WhisperQwen3EoTClassifier
+from whisper_qwen3_head.profiling import ProfilerCallback, ProfilingArguments
 from whisper_qwen3_head.prompt import AUDIO_BOS_TOKEN, AUDIO_EOS_TOKEN, AUDIO_TOKEN, SPECIAL_TOKENS, SpecialIds
 
 logger = logging.getLogger(__name__)
@@ -117,8 +118,8 @@ def compute_metrics(eval_pred) -> dict[str, float]:
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    parser = HfArgumentParser((ModelArguments, DataArguments, ProfilingArguments, TrainingArguments))
+    model_args, data_args, profiling_args, training_args = parser.parse_args_into_dataclasses()
 
     # Required: the raw dataset's columns (`audio`, `label`, `weight`, ...) don't match
     # `WhisperQwen3EoTClassifier.forward`'s parameter names -- only the collator's *output*
@@ -223,6 +224,18 @@ def main():
 
     collator = EoTCollator(tokenizer, feature_extractor, special_ids, max_audio_seconds=data_args.max_audio_seconds)
 
+    callbacks = []
+    if profiling_args.profile:
+        needed = profiling_args.total_steps()
+        if training_args.max_steps > 0 and training_args.max_steps < needed:
+            logger.warning(
+                "--profile needs >= %d steps (skip_first+wait+warmup+active x repeat) but "
+                "--max_steps=%d; the trace will be cut short",
+                needed,
+                training_args.max_steps,
+            )
+        callbacks.append(ProfilerCallback(profiling_args))
+
     trainer = EoTTrainer(
         model=model,
         args=training_args,
@@ -233,8 +246,12 @@ def main():
         feature_extractor=feature_extractor,
         compute_metrics=compute_metrics if eval_dataset is not None else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if eval_dataset is not None else None,
+        callbacks=callbacks or None,
     )
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    if profiling_args.profile:
+        logger.info("--profile run finished; skipping checkpoint save/push (this run was for tracing, not training)")
+        return
     trainer.save_model(training_args.output_dir)
 
     if push_to_hub:

@@ -109,6 +109,10 @@ def iter_causal_examples(
                 "label": label,
                 "weight": example_weight,
                 "language": row["language"],
+                "count_span": n_spans,
+                "word_count": len(row["words"]), 
+                "full_audio_seconds": len(audio) / sr,
+                "audio_seconds": cut_sample / sr,
             }
 
 
@@ -130,7 +134,8 @@ def expand_to_causal_examples(
         row = {key: batch[key][i] for key in batch}
         for example in iter_causal_examples(row, singleton_keep_prob=singleton_keep_prob, degrader=degrader):
             for key, value in example.items():
-                out[key].append(value)
+                if key in out:
+                    out[key].append(value)
     return out
 
 
